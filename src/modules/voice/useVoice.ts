@@ -71,9 +71,9 @@ export function useVoice(opts: UseVoiceOptions) {
     setListening(true);
     setInterim("Listening… speak now");
 
-    // WebView2's native recognizer generally gives better results than the
-    // legacy System.Speech PowerShell engine. Use it when available, while
-    // retaining Windows offline dictation as the fallback.
+    // WebView2 recognition usually handles conversational speech better than
+    // the legacy System.Speech PowerShell engine. Keep the offline engine as a
+    // fallback so the companion remains usable without cloud speech.
     if (getSpeechRecognitionCtor()) {
       const handle = startRecognition({
         lang: optsRef.current.lang ?? navigator.language ?? "en-US",
