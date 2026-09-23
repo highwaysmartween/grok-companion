@@ -1,4 +1,14 @@
-export type PetMood = "idle" | "listening" | "thinking" | "speaking" | "happy" | "error";
+export type PetMood =
+  | "idle"
+  | "listening"
+  | "thinking"
+  | "speaking"
+  | "happy"
+  | "confused"
+  | "annoyed"
+  | "sad"
+  | "sleeping"
+  | "error";
 
 export type ChatRole = "user" | "assistant" | "system";
 
