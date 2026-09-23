@@ -25,7 +25,11 @@ function errText(err: unknown): string {
   if (typeof err === "string") return err;
   if (err instanceof Error) return err.message;
   if (err && typeof err === "object" && "message" in err) return String((err as { message: unknown }).message);
-  try { return JSON.stringify(err); } catch { return String(err); }
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
 }
 
 export function useVoice(opts: UseVoiceOptions) {
@@ -35,12 +39,13 @@ export function useVoice(opts: UseVoiceOptions) {
   const [error, setError] = useState<string | null>(null);
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [wakeArmed, setWakeArmed] = useState(false);
-  const speakingRef = useRef(false);
-  const commandListeningRef = useRef(false);
-  const optsRef = useRef(opts);
+
   const browserRecognitionRef = useRef<{ stop: () => void; abort: () => void } | null>(null);
   const listenGen = useRef(0);
   const wakeGen = useRef(0);
+  const micLockRef = useRef<"manual" | "wake" | null>(null);
+  const optsRef = useRef(opts);
+
   optsRef.current = opts;
 
   useEffect(() => {
@@ -53,7 +58,7 @@ export function useVoice(opts: UseVoiceOptions) {
 
   const stopListen = useCallback(() => {
     listenGen.current += 1;
-    commandListeningRef.current = false;
+    micLockRef.current = null;
     browserRecognitionRef.current?.abort();
     browserRecognitionRef.current = null;
     setListening(false);
@@ -61,27 +66,30 @@ export function useVoice(opts: UseVoiceOptions) {
   }, []);
 
   const startListen = useCallback(() => {
+    const gen = ++listenGen.current;
+    micLockRef.current = "manual";
     setError(null);
     stopSpeaking();
     setSpeaking(false);
-    speakingRef.current = false;
-    commandListeningRef.current = true;
-    void cancelWakeWord();
-    const gen = ++listenGen.current;
-    setListening(true);
-    setInterim("Listening… speak now");
 
-    // WebView2 recognition usually handles conversational speech better than
-    // the legacy System.Speech PowerShell engine. Keep the offline engine as a
-    // fallback so the companion remains usable without cloud speech.
+    void cancelWakeWord();
+    wakeGen.current += 1;
+    setWakeArmed(false);
+
+    setListening(true);
+    setInterim("Listening…");
+
     if (getSpeechRecognitionCtor()) {
       const handle = startRecognition({
         lang: optsRef.current.lang ?? navigator.language ?? "en-US",
-        onInterim: (text) => { if (gen === listenGen.current) setInterim(text); },
+        onInterim: (text) => {
+          if (gen !== listenGen.current) return;
+          setInterim(text);
+        },
         onFinal: (text) => {
           if (gen !== listenGen.current) return;
           browserRecognitionRef.current = null;
-          commandListeningRef.current = false;
+          micLockRef.current = null;
           setListening(false);
           setInterim("");
           if (text.trim()) optsRef.current.onFinalTranscript(text.trim());
@@ -89,19 +97,20 @@ export function useVoice(opts: UseVoiceOptions) {
         onError: (message) => {
           if (gen !== listenGen.current) return;
           browserRecognitionRef.current = null;
-          commandListeningRef.current = false;
+          micLockRef.current = null;
           setListening(false);
           setInterim("");
           setError(message);
         },
         onEnd: () => {
-          if (gen !== listenGen.current || browserRecognitionRef.current === null) return;
+          if (gen !== listenGen.current) return;
           browserRecognitionRef.current = null;
-          commandListeningRef.current = false;
+          micLockRef.current = null;
           setListening(false);
           setInterim("");
         },
       });
+
       if (handle) {
         browserRecognitionRef.current = handle;
         return;
@@ -110,33 +119,37 @@ export function useVoice(opts: UseVoiceOptions) {
 
     void (async () => {
       try {
-        await new Promise((r) => setTimeout(r, 250));
+        const text = await listenWindowsOffline(12);
         if (gen !== listenGen.current) return;
-        const text = await listenWindowsOffline(15);
-        if (gen !== listenGen.current) return;
-        setInterim("");
+        micLockRef.current = null;
         setListening(false);
+        setInterim("");
         if (text.trim()) optsRef.current.onFinalTranscript(text.trim());
       } catch (err) {
         if (gen !== listenGen.current) return;
+        micLockRef.current = null;
         setListening(false);
         setInterim("");
-        setError(errText(err) || "Speech recognition failed. Try typing or tap the mic again.");
-      } finally {
-        commandListeningRef.current = false;
+        setError(errText(err) || "Speech recognition failed.");
       }
     })();
-  }, [stopListen]);
+  }, []);
 
   const toggleListen = useCallback(() => {
-    if (listening) stopListen(); else startListen();
+    if (listening) stopListen();
+    else startListen();
   }, [listening, startListen, stopListen]);
+
+  const stopSpeak = useCallback(() => {
+    stopSpeaking();
+    setSpeaking(false);
+  }, []);
 
   const speak = useCallback((text: string) => {
     if (!text.trim()) return;
     setError(null);
-    speakingRef.current = true;
     setSpeaking(true);
+
     void (async () => {
       try {
         await speakNatural(text, DEFAULT_NEURAL_VOICE);
@@ -147,19 +160,14 @@ export function useVoice(opts: UseVoiceOptions) {
             utter.onend = () => resolve();
             utter.onerror = () => reject(new Error("web speech failed"));
           });
-        } catch (err) { setError(errText(err) || "Could not speak."); }
+        } catch (err) {
+          setError(errText(err) || "Could not speak.");
+        }
       } finally {
-        speakingRef.current = false;
         setSpeaking(false);
       }
     })();
   }, [voices]);
-
-  const stopSpeak = useCallback(() => {
-    stopSpeaking();
-    speakingRef.current = false;
-    setSpeaking(false);
-  }, []);
 
   useEffect(() => {
     if (!opts.wakeWordEnabled) {
@@ -167,55 +175,79 @@ export function useVoice(opts: UseVoiceOptions) {
       setWakeArmed(false);
       return;
     }
+
     const gen = ++wakeGen.current;
     const word = opts.wakeWord ?? "hey";
-    let cancelled = false;
+
     const loop = async () => {
-      while (!cancelled && gen === wakeGen.current) {
-        if (speakingRef.current || commandListeningRef.current) {
-          await new Promise((r) => setTimeout(r, 400));
+      while (gen === wakeGen.current) {
+        if (micLockRef.current === "manual" || speaking) {
+          await new Promise((r) => setTimeout(r, 250));
           continue;
         }
+
         setWakeArmed(true);
         setInterim(`Say “${word}”…`);
+
         try {
-          await waitWakeWord(word);
-          if (cancelled || gen !== wakeGen.current) return;
+          const res = await waitWakeWord(word);
+          if (gen !== wakeGen.current) return;
+          if (res !== "hey") {
+            continue;
+          }
+
+          micLockRef.current = "wake";
           setWakeArmed(false);
-          setError(null);
-          commandListeningRef.current = true;
           setListening(true);
           setInterim("Heard you — go ahead…");
-          let text = "";
-          try { text = await listenWindowsOffline(10); } finally { commandListeningRef.current = false; }
-          if (cancelled || gen !== wakeGen.current) return;
+
+          const text = await listenWindowsOffline(10);
+          if (gen !== wakeGen.current) return;
+
+          micLockRef.current = null;
           setListening(false);
           setInterim("");
-          if (text) optsRef.current.onFinalTranscript(text.replace(/^\s*(hey|hay|hi)\b[\s,]*/i, "").trim() || text);
-        } catch (err) {
-          if (cancelled || gen !== wakeGen.current) return;
-          const msg = err instanceof Error ? err.message : String(err);
-          if (!/timed out|cancelled/i.test(msg)) { setError(msg); await new Promise((r) => setTimeout(r, 1600)); setError(null); }
-          setListening(false);
+
+          if (text.trim()) {
+            const cleaned = text.replace(/^(hey|hi|hay)\b[\s,]*/i, "").trim();
+            optsRef.current.onFinalTranscript(cleaned || text);
+          }
+        } catch {
+          if (gen !== wakeGen.current) return;
           setWakeArmed(true);
         }
       }
     };
+
     void loop();
-    return () => { cancelled = true; wakeGen.current += 1; setWakeArmed(false); };
-  }, [opts.wakeWordEnabled, opts.wakeWord]);
+
+    return () => {
+      wakeGen.current += 1;
+      setWakeArmed(false);
+      void cancelWakeWord();
+    };
+  }, [opts.wakeWordEnabled, opts.wakeWord, speaking]);
 
   useEffect(() => () => {
     listenGen.current += 1;
     wakeGen.current += 1;
     browserRecognitionRef.current?.abort();
+    void cancelWakeWord();
     stopSpeaking();
   }, []);
 
   return {
-    listening, speaking, interim, error, wakeArmed,
+    listening,
+    speaking,
+    interim,
+    error,
+    wakeArmed,
     sttAvailable: true,
     ttsAvailable: speechSynthesisAvailable(),
-    startListen, stopListen, toggleListen, speak, stopSpeak,
+    startListen,
+    stopListen,
+    toggleListen,
+    speak,
+    stopSpeak,
   };
 }
