@@ -1,0 +1,119 @@
+.settings-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(2, 6, 18, 0.55);
+  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 12px 12px;
+  z-index: 20;
+}
+
+.settings-card {
+  width: 100%;
+  max-height: 100%;
+  overflow: auto;
+  background: linear-gradient(180deg, rgba(16, 28, 58, 0.96), rgba(8, 14, 32, 0.96));
+  border: 1px solid rgba(126, 240, 255, 0.22);
+  border-radius: 16px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  color: #dcefff;
+}
+
+.settings-card header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.settings-card h2 { margin: 0; font-size: 16px; }
+.settings-card h3 { margin: 8px 0 4px; font-size: 13px; }
+.settings-card .x {
+  background: transparent;
+  border: 0;
+  color: #7ef0ff;
+  font-size: 22px;
+  cursor: pointer;
+}
+
+.settings-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: rgba(190, 220, 240, 0.7);
+}
+.settings-card input,
+.settings-card select,
+.settings-card textarea {
+  font: inherit;
+  text-transform: none;
+  letter-spacing: 0;
+  color: #e8f7ff;
+  background: rgba(4, 10, 24, 0.7);
+  border: 1px solid rgba(126, 240, 255, 0.2);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.settings-card textarea { resize: vertical; }
+
+.fine { font-size: 11px; color: rgba(180, 210, 230, 0.7); margin: 0; text-transform: none; letter-spacing: 0; }
+.link {
+  background: none;
+  border: 0;
+  color: #7ef0ff;
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+  text-decoration: underline;
+}
+.link.danger { color: #ff8aa0; }
+
+.row { display: flex; flex-wrap: wrap; gap: 10px; }
+.check {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 6px !important;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 13px !important;
+  color: #dcefff !important;
+}
+
+.memories ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.memories li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  background: rgba(4, 10, 24, 0.45);
+  padding: 6px 8px;
+  border-radius: 8px;
+}
+
+.settings-card footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 6px;
+}
+.settings-card footer button,
+.settings-card footer .ghost {
+  border-radius: 8px;
+  padding: 8px 14px;
+  border: 1px solid rgba(126, 240, 255, 0.3);
+  background: linear-gradient(180deg, #3de0ff, #1a8bb8);
+  color: #041018;
+  cursor: pointer;
+  font-weight: 600;
+}
+.settings-card footer .ghost {
+  background: transparent;
+  color: #7ef0ff;
+}
+.status-msg { font-size: 12px; color: #7ef0ff; margin: 0; }
