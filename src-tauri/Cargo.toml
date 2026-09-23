@@ -1,6 +1,6 @@
 [package]
 name = "grok-desktop-companion"
-version = "0.1.0"
+version = "1.1.0"
 description = "Grok Companion — a personal desktop AI pet powered by xAI"
 authors = ["Frank"]
 edition = "2021"
