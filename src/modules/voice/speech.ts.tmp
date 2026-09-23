@@ -1,3 +1,0 @@
-export function speechRecognitionAvailable(): boolean {
-  return typeof window !== "undefined" && Boolean(window.SpeechRecognition ?? window.webkitSpeechRecognition);
-}
