@@ -1,149 +1,182 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { ChatMessage, PetMood, PublicSettings } from "../../types";
-import { handleMemoryIntent, parseMemoryIntent } from "../memory/memoryIntent";
-import { cancelChat, streamChat } from "./chatApi";
+/** Voice helpers. STT: Windows offline. TTS: Edge neural (real voice) with Web Speech fallback. */
 
-const HISTORY_KEY = "grok-companion.conversation.v1";
-const uid = () => crypto.randomUUID();
+import { invoke } from "@tauri-apps/api/core";
 
-function loadHistory(): ChatMessage[] {
+export function getSpeechRecognitionCtor(): SpeechRecognitionConstructor | null {
+  if (typeof window === "undefined") return null;
+  return window.SpeechRecognition ?? window.webkitSpeechRecognition ?? null;
+}
+
+export function speechRecognitionAvailable(): boolean {
+  return true;
+}
+
+export function speechSynthesisAvailable(): boolean {
+  return typeof window !== "undefined" && "speechSynthesis" in window;
+}
+
+export function listVoices(): SpeechSynthesisVoice[] {
+  if (!speechSynthesisAvailable()) return [];
+  return window.speechSynthesis.getVoices();
+}
+
+/** Prefer neural / natural female voices when Web Speech is used as fallback. */
+export function pickVoice(
+  voices: SpeechSynthesisVoice[],
+  preferredName?: string,
+): SpeechSynthesisVoice | null {
+  if (voices.length === 0) return null;
+  if (preferredName) {
+    const exact = voices.find((v) => v.name === preferredName);
+    if (exact) return exact;
+  }
+  const en = voices.filter((v) => v.lang.toLowerCase().startsWith("en"));
+  const pool = en.length ? en : voices;
+  const score = (name: string) => {
+    const n = name.toLowerCase();
+    if (/xiaoxiao|yan|luna|hong kong|hongkong|huihui|nanami/.test(n)) return 0;
+    if (/emma|aria|natasha|molly|natural|neural|online|ana/.test(n)) return 1;
+    if (/zira|samantha|hazel|susan/.test(n)) return 2;
+    if (/female|woman|girl/.test(n)) return 3;
+    if (/jenny/.test(n)) return 4;
+    return 5;
+  };
+  return [...pool].sort((a, b) => score(a.name) - score(b.name))[0] ?? null;
+}
+
+export interface RecognitionHandle {
+  stop: () => void;
+  abort: () => void;
+}
+
+/** Offline Windows dictation (System.Speech) — no network. */
+export async function listenWindowsOffline(timeoutSecs = 8): Promise<string> {
+  return invoke<string>("stt_listen_windows", { timeoutSecs });
+}
+
+/** Blocks until wake word (default "hey") via Windows offline speech. */
+export async function waitWakeWord(word = "hey"): Promise<string> {
+  return invoke<string>("stt_wait_wake_word", { word });
+}
+
+/** Stop the background wake-word PowerShell so tap-to-talk can own the mic. */
+export async function cancelWakeWord(): Promise<void> {
   try {
-    const value = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
-    return Array.isArray(value) ? value.filter((m) => m && m.role && m.content) : [];
+    await invoke("stt_cancel_wake");
   } catch {
-    return [];
+    // ignore
   }
 }
 
-function emotionForReply(text: string): PetMood {
-  const lower = text.toLowerCase();
-  if (/sorry|error|can't|cannot|failed|unable|glitch/.test(lower)) return "error";
-  if (/not sure|confused|unclear|what do you mean/.test(lower)) return "confused";
-  if (/great|awesome|glad|love that|congrat/.test(lower)) return "happy";
-  return "idle";
+/** Microsoft Edge neural TTS — sounds like a real person (needs network). */
+/** Default: Yan (HK) — East Asian teen/young woman speaking English. */
+export const DEFAULT_NEURAL_VOICE = "en-HK-YanNeural";
+
+export async function speakNatural(
+  text: string,
+  voice = DEFAULT_NEURAL_VOICE,
+): Promise<void> {
+  await invoke("tts_speak_natural", { text, voice });
 }
 
-export interface ChatController {
-  settings: PublicSettings | null;
-  setMood: (mood: PetMood) => void;
-  speakReply?: (text: string) => void;
+export async function stopNaturalSpeaking(): Promise<void> {
+  try {
+    await invoke("tts_stop");
+  } catch {
+    // ignore
+  }
 }
 
-const VOICE_FALLBACKS = [
-  "Hmm, my brain glitched for a sec. Say that again?",
-  "Lost the thread — try me one more time.",
-  "Ugh, connection hiccup. Still here though.",
-];
+export function startRecognition(opts: {
+  lang?: string;
+  onStart?: () => void;
+  onInterim?: (text: string) => void;
+  onFinal?: (text: string) => void;
+  onError?: (message: string) => void;
+  onEnd?: () => void;
+}): RecognitionHandle | null {
+  const Ctor = getSpeechRecognitionCtor();
+  if (!Ctor) {
+    opts.onError?.("No cloud speech in this WebView — use Windows offline mic or type.");
+    return null;
+  }
 
-export function useChat(controller: ChatController) {
-  const [messages, setMessages] = useState<ChatMessage[]>(loadHistory);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const aborting = useRef(false);
-  const busyRef = useRef(false);
-  const ctrl = useRef(controller);
-  ctrl.current = controller;
-  const messagesRef = useRef(messages);
-  messagesRef.current = messages;
+  const rec = new Ctor();
+  rec.lang = opts.lang ?? navigator.language ?? "en-US";
+  rec.continuous = false;
+  rec.interimResults = true;
+  rec.maxAlternatives = 1;
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(messages.slice(-100)));
-    } catch { /* storage can be unavailable in preview mode */ }
-  }, [messages]);
+  rec.onstart = () => opts.onStart?.();
+  rec.onresult = (ev) => {
+    let interim = "";
+    let finalText = "";
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const res = ev.results[i];
+      const transcript = res[0]?.transcript ?? "";
+      if (res.isFinal) finalText += transcript;
+      else interim += transcript;
+    }
+    if (interim) opts.onInterim?.(interim);
+    if (finalText) opts.onFinal?.(finalText.trim());
+  };
+  rec.onerror = (ev) => {
+    const map: Record<string, string> = {
+      "not-allowed": "Microphone permission was denied.",
+      "no-speech": "I didn't catch that — try again?",
+      "audio-capture": "No microphone found.",
+      network: "Cloud speech needs internet. The app uses Windows offline dictation when you tap the mic.",
+      aborted: "Listening cancelled.",
+    };
+    const message = map[ev.error] ?? `Speech error: ${ev.error}`;
+    if (ev.error !== "aborted") opts.onError?.(message);
+  };
+  rec.onend = () => opts.onEnd?.();
 
-  const send = useCallback(async (raw: string, meta?: { fromVoice?: boolean }) => {
-    const text = raw.trim();
-    if (!text || busyRef.current) return;
-    aborting.current = false;
-    setError(null);
-    const userMsg: ChatMessage = { id: uid(), role: "user", content: text };
-    const history = [...messagesRef.current.filter((m) => !m.error && m.content), userMsg].map((m) => ({ role: m.role, content: m.content }));
-    messagesRef.current = [...messagesRef.current, userMsg];
-    setMessages((m) => [...m, userMsg]);
-    const { settings, setMood, speakReply } = ctrl.current;
-    const wantSpeak = settings?.ttsEnabled !== false && (meta?.fromVoice === true || settings?.autoSpeak !== false);
+  try {
+    rec.start();
+  } catch (err) {
+    opts.onError?.(err instanceof Error ? err.message : "Could not start microphone.");
+    return null;
+  }
 
-    const intent = parseMemoryIntent(text);
-    if (intent) {
+  return {
+    stop: () => {
       try {
-        const reply = await handleMemoryIntent(intent);
-        setMessages((m) => [...m, { id: uid(), role: "assistant", content: reply, local: true }]);
-        setMood("happy");
-        if (wantSpeak) speakReply?.(reply); else window.setTimeout(() => setMood("idle"), 1200);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-        setMood("error");
+        rec.stop();
+      } catch {
+        // ignore
       }
-      return;
-    }
-
-    if (!settings?.hasApiKey) {
-      const tip = "I need Grok connected before I can talk. Open Settings and choose Grok CLI or add an xAI API key.";
-      setMessages((m) => [...m, { id: uid(), role: "assistant", content: tip, local: true, error: true }]);
-      setMood("error");
-      if (wantSpeak || meta?.fromVoice) speakReply?.(tip);
-      return;
-    }
-
-    const assistantId = uid();
-    setMessages((m) => [...m, { id: assistantId, role: "assistant", content: "", pending: true }]);
-    busyRef.current = true;
-    setBusy(true);
-    setMood("thinking");
-    let assembled = "";
-    try {
-      await streamChat(history, (event) => {
-        if (aborting.current) return;
-        if (event.event === "delta") {
-          assembled += event.data.text;
-          setMood("speaking");
-          setMessages((m) => m.map((msg) => msg.id === assistantId ? { ...msg, content: assembled, pending: true } : msg));
-        } else if (event.event === "done") {
-          assembled = event.data.fullText || assembled;
-          setMessages((m) => m.map((msg) => msg.id === assistantId ? { ...msg, content: assembled || "…", pending: false } : msg));
-        } else if (event.event === "error") {
-          setError(event.data.message);
-          setMessages((m) => m.map((msg) => msg.id === assistantId ? { ...msg, content: assembled || event.data.message, pending: false, error: !assembled } : msg));
-          setMood("error");
-        }
-      });
-      if (!aborting.current && assembled) {
-        setMood(emotionForReply(assembled));
-        if (wantSpeak) speakReply?.(assembled);
-      } else if (!assembled) {
-        const fallback = VOICE_FALLBACKS[Math.floor(Math.random() * VOICE_FALLBACKS.length)]!;
-        setMessages((m) => m.map((msg) => msg.id === assistantId ? { ...msg, content: fallback, pending: false, error: true, local: true } : msg));
-        if (wantSpeak || meta?.fromVoice) speakReply?.(fallback);
+    },
+    abort: () => {
+      try {
+        rec.abort();
+      } catch {
+        // ignore
       }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (!aborting.current) {
-        setError(message);
-        setMessages((m) => m.map((msg) => msg.id === assistantId ? { ...msg, content: message, pending: false, error: true } : msg));
-        setMood("error");
-        if (wantSpeak || meta?.fromVoice) speakReply?.(message);
-      }
-    } finally {
-      busyRef.current = false;
-      setBusy(false);
-    }
-  }, []);
-
-  const stop = useCallback(async () => {
-    aborting.current = true;
-    await cancelChat();
-    busyRef.current = false;
-    setBusy(false);
-    ctrl.current.setMood("idle");
-  }, []);
-
-  const clear = useCallback(() => {
-    setMessages([]);
-    setError(null);
-    localStorage.removeItem(HISTORY_KEY);
-    ctrl.current.setMood("idle");
-  }, []);
-
-  return { messages, busy, error, send, stop, clear };
+    },
+  };
 }
+
+/** Legacy Web Speech (robotic on many PCs) — only used if natural TTS fails. */
+export function speak(text: string, opts?: { voice?: SpeechSynthesisVoice | null; rate?: number }) {
+  if (!speechSynthesisAvailable()) {
+    throw new Error("Speech synthesis is not available in this WebView.");
+  }
+  window.speechSynthesis.cancel();
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.rate = opts?.rate ?? 0.98;
+  utter.pitch = 1.0;
+  if (opts?.voice) utter.voice = opts.voice;
+  window.speechSynthesis.speak(utter);
+  return utter;
+}
+
+export function stopSpeaking() {
+  if (speechSynthesisAvailable()) {
+    window.speechSynthesis.cancel();
+  }
+  void stopNaturalSpeaking();
+}
+
+
