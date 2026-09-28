@@ -19,6 +19,22 @@ const FLASH_LINES = [
   "Hmm. Just this once.",
 ];
 
+function classifyUserMood(raw: string): PetMood {
+  const text = raw.toLowerCase();
+  if (/(hello|hi|hey|thanks|love|cool|awesome|great|happy|good|nice|amazing|glad|fun|smile)/.test(text)) return "happy";
+  if (/(what|why|confused|unclear|huh|lost|not sure|weird|wait|sorry|uncertain)/.test(text)) return "confused";
+  if (/(angry|annoyed|ugh|hate|bad|annoying|stupid|damn|furious|upset|irritated)/.test(text)) return "annoyed";
+  if (/(sad|down|lonely|tired|cry|hurt|upset|rough|depressed|exhausted)/.test(text)) return "sad";
+  if (/(sleep|nap|bed|night|rest|yawn|drowsy)/.test(text)) return "sleeping";
+  return "idle";
+}
+
+function resolveIdleMood(current: PetMood): PetMood {
+  if (current === "idle") return "happy";
+  if (current === "happy") return "idle";
+  return current;
+}
+
 export default function App() {
   const [settings, setSettings] = useState<PublicSettings | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -34,13 +50,24 @@ export default function App() {
   const [flash, setFlash] = useState(false);
   const preFlashIdx = useRef<number | null>(null);
   const sendRef = useRef<(text: string, meta?: { fromVoice?: boolean }) => Promise<void>>(async () => undefined);
+  const lastInteractionRef = useRef(Date.now());
+
+  const touchMood = useCallback((next: PetMood) => {
+    lastInteractionRef.current = Date.now();
+    setMood(next);
+  }, []);
 
   const voice = useVoice({
     wakeWordEnabled: true,
     wakeWord: "hey",
-    onFinalTranscript: (text) => { setInput(""); void sendRef.current(text, { fromVoice: true }); },
+    onFinalTranscript: (text) => {
+      setInput("");
+      const nextMood = classifyUserMood(text);
+      touchMood(nextMood);
+      void sendRef.current(text, { fromVoice: true });
+    },
   });
-  const chat = useChat({ settings, setMood, speakReply: (text) => voice.speak(plainForSpeech(text)) });
+  const chat = useChat({ settings, setMood: touchMood, speakReply: (text) => voice.speak(plainForSpeech(text)) });
 
   const handleUserText = useCallback(async (text: string, meta?: { fromVoice?: boolean }) => {
     const flashCmd = isFlashCommand(text);
@@ -49,33 +76,61 @@ export default function App() {
       const cur = modelsCatalog[modelIdx];
       if (!cur || !prefer(cur)) {
         const idx = modelsCatalog.findIndex(prefer);
-        if (idx >= 0) { preFlashIdx.current = modelIdx; setModelIdx(idx); }
+        if (idx >= 0) {
+          preFlashIdx.current = modelIdx;
+          setModelIdx(idx);
+        }
       }
       setFlash(true);
-      setMood("happy");
+      touchMood("happy");
       voice.speak(FLASH_LINES[Math.floor(Math.random() * FLASH_LINES.length)]!);
       return;
     }
     if (flashCmd === "off") {
       setFlash(false);
-      if (preFlashIdx.current != null) { setModelIdx(preFlashIdx.current); preFlashIdx.current = null; }
-      setMood("happy");
+      if (preFlashIdx.current != null) {
+        setModelIdx(preFlashIdx.current);
+        preFlashIdx.current = null;
+      }
+      touchMood("happy");
       voice.speak("Whatever. Clothes back on.");
       return;
     }
+    touchMood(classifyUserMood(text));
     await chat.send(text, meta);
-  }, [chat, voice, modelsCatalog, modelIdx]);
+  }, [chat, voice, modelsCatalog, modelIdx, touchMood]);
+
   sendRef.current = handleUserText;
 
   useEffect(() => {
-    if (voice.listening) setMood("listening");
-    else if (chat.busy) setMood("thinking");
-    else if (voice.speaking) setMood("speaking");
-  }, [voice.listening, voice.speaking, chat.busy]);
+    if (voice.listening) {
+      touchMood("listening");
+      return;
+    }
+    if (chat.busy) {
+      touchMood("thinking");
+      return;
+    }
+    if (voice.speaking) {
+      touchMood("speaking");
+      return;
+    }
+
+    const idleSince = Date.now() - lastInteractionRef.current;
+    if (idleSince > 35000) {
+      setMood("sleeping");
+    } else if (idleSince > 15000) {
+      setMood((current) => (current === "idle" ? "happy" : current));
+    }
+  }, [voice.listening, voice.speaking, chat.busy, touchMood]);
 
   useEffect(() => {
-    if (!voice.speaking && !voice.listening && !chat.busy) setMood((m) => ["speaking", "listening", "thinking"].includes(m) ? "idle" : m);
-  }, [voice.speaking, voice.listening, chat.busy]);
+    if (voice.listening || voice.speaking || chat.busy) return;
+    const idleTimer = window.setTimeout(() => {
+      setMood((current) => resolveIdleMood(current));
+    }, 7000);
+    return () => window.clearTimeout(idleTimer);
+  }, [voice.listening, voice.speaking, chat.busy, mood]);
 
   useEffect(() => {
     void fetch("/models/catalog.json").then((r) => r.json()).then((list: ModelOpt[]) => {
@@ -88,27 +143,48 @@ export default function App() {
       const status = await checkConnection();
       setConnectionMessage(status.message); setModels(status.models);
       setConnection(!status.hasApiKey ? "nokey" : status.connected ? "online" : "error");
-    } catch (err) { setConnection("offline"); setConnectionMessage(err instanceof Error ? err.message : String(err)); }
+    } catch (err) {
+      setConnection("offline");
+      setConnectionMessage(err instanceof Error ? err.message : String(err));
+    }
   }, []);
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const s = await getSettings(); if (cancelled) return;
-        setSettings(s); if (!s.hasApiKey) setSettingsOpen(true);
-        await getCurrentWindow().setAlwaysOnTop(s.alwaysOnTop); await refreshConnection();
-      } catch (err) { if (!cancelled) { setConnection("error"); setConnectionMessage(err instanceof Error ? err.message : String(err)); } }
+        const s = await getSettings();
+        if (cancelled) return;
+        setSettings(s);
+        if (!s.hasApiKey) setSettingsOpen(true);
+        await getCurrentWindow().setAlwaysOnTop(s.alwaysOnTop);
+        await refreshConnection();
+      } catch (err) {
+        if (!cancelled) {
+          setConnection("error");
+          setConnectionMessage(err instanceof Error ? err.message : String(err));
+        }
+      }
     })();
     const id = window.setInterval(() => void refreshConnection(), 60_000);
-    return () => { cancelled = true; window.clearInterval(id); };
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
   }, [refreshConnection]);
 
   const name = settings?.companionName || "Nova";
   const title = useMemo(() => `${name} — Grok Companion`, [name]);
   const toggleCompact = async () => {
     const next = !compact; setCompact(next); setChatOpen(!next);
-    try { const { LogicalSize } = await import("@tauri-apps/api/dpi"); const win = getCurrentWindow(); await win.setSize(new LogicalSize(next ? 440 : 480, next ? 640 : 820)); await win.setAlwaysOnTop(next || !!settings?.alwaysOnTop); } catch { /* browser preview */ }
+    try {
+      const { LogicalSize } = await import("@tauri-apps/api/dpi");
+      const win = getCurrentWindow();
+      await win.setSize(new LogicalSize(next ? 440 : 480, next ? 640 : 820));
+      await win.setAlwaysOnTop(next || !!settings?.alwaysOnTop);
+    } catch {
+      // preview/browser fallback
+    }
   };
   const sendTyped = () => { const text = input.trim(); if (!text) return; setInput(""); void handleUserText(text); };
   const wakeHint = voice.listening ? voice.interim || "Listening…" : voice.wakeArmed ? voice.interim || "Say hey…" : voice.speaking ? "Speaking…" : null;
@@ -128,9 +204,9 @@ export default function App() {
     {!compact && <StatusBar connection={connection} connectionMessage={connectionMessage} mood={mood} listening={voice.listening} speaking={voice.speaking} busy={chat.busy} wakeArmed={voice.wakeArmed} interim={voice.interim} />}
     {(!compact || chatOpen) && <div className={compact ? "compact-chat" : "full-chat"}>
       {compact && <button type="button" className="chat-close" onClick={() => setChatOpen(false)}>×</button>}
-      <ChatPanel messages={chat.messages} busy={chat.busy} listening={voice.listening} interim={voice.interim || (voice.wakeArmed ? "Say hey…" : "")} input={input} onInput={setInput} onSend={sendTyped} onMic={() => voice.listening ? voice.stopListen() : (voice.stopSpeak(), voice.startListen())} onStopSpeak={() => { voice.stopSpeak(); setMood("idle"); }} speaking={voice.speaking} sttAvailable={voice.sttAvailable} companionName={name} />
+      <ChatPanel messages={chat.messages} busy={chat.busy} listening={voice.listening} interim={voice.interim || (voice.wakeArmed ? "Say hey…" : "")} input={input} onInput={setInput} onSend={sendTyped} onMic={() => (voice.listening ? voice.stopListen() : (voice.stopSpeak(), voice.startListen()))} onStopSpeak={() => { voice.stopSpeak(); touchMood("idle"); }} speaking={voice.speaking} sttAvailable={voice.sttAvailable} companionName={name} />
     </div>}
-    {compact && !chatOpen && <div className="compact-mic"><span className="wake-hint">{wakeHint}</span><button type="button" className={voice.listening ? "hot" : voice.wakeArmed ? "armed" : ""} onClick={() => voice.listening ? voice.stopListen() : voice.startListen()}>{voice.listening ? "Listening…" : voice.wakeArmed ? "Say hey…" : "Tap to talk"}</button></div>}
+    {compact && !chatOpen && <div className="compact-mic"><span className="wake-hint">{wakeHint}</span><button type="button" className={voice.listening ? "hot" : voice.wakeArmed ? "armed" : ""} onClick={() => (voice.listening ? voice.stopListen() : voice.startListen())}>{voice.listening ? "Listening…" : voice.wakeArmed ? "Say hey…" : "Tap to talk"}</button></div>}
     {voice.error && <p className="banner">{voice.error}</p>}{chat.error && <p className="banner">{chat.error}</p>}
     {settingsOpen && settings && <SettingsPanel settings={settings} models={models} onClose={() => setSettingsOpen(false)} onSaved={(s) => { setSettings(s); void refreshConnection(); }} />}
   </div>;
@@ -138,8 +214,9 @@ export default function App() {
 
 function isFlashCommand(text: string): "on" | "off" | null {
   const t = text.trim().toLowerCase().replace(/^hey\b[\s,]*/i, "");
-  if (/\b(flash|undress|strip|topless|get\s*naked|take\s*(it|them|your\s*)?(clothes|top|shirt)?\s*off|tits?\s*out|boobs?\s*out|show\s*(me\s*)?(your\s*)?(tits|boobs|breasts|body|chest))\b/.test(t) || t === "flash" || t === "strip") return "on";
+  if (/\b(flash|undress|strip|topless|get\s*naked|take\s*(it|them|your\s*)?(clothes|top|shirt)?\s*off|tits?\s*out|boobs?\s*out|show\s*(me\s*)?(your\s*)?(tits|boobs|breasts|body|chest))\b/.test(t)) return "on";
   if (/\b(cover\s*up|put\s*(it|them|clothes)\s*on|unflash|dress(\s*up)?)\b/.test(t)) return "off";
   return null;
 }
+
 function plainForSpeech(text: string) { return text.replace(/[`*_#]/g, "").replace(/\n+/g, " ").trim(); }
