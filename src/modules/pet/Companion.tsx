@@ -1,7 +1,7 @@
 import { useRef } from "react";
 import { getCurrentWindow, currentMonitor, primaryMonitor } from "@tauri-apps/api/window";
 import type { PetMood } from "../../types";
-import { CompanionVRM, PET_VRM_VERSION } from "./CompanionVRM";
+import { CompanionVRM, PET_VRM_VERSION, type GestureCue } from "./CompanionVRM";
 import type { RoamAmount, RoamDriver, Room } from "./behaviour";
 import "./Companion.css";
 
@@ -16,6 +16,10 @@ interface Props {
   /** Temporarily hold still (hovered, chat open, tray pause…). */
   roamPaused?: boolean;
   reactKey?: number;
+  /** One-shot gesture requests (wave / kiss / jumps). */
+  cue?: GestureCue | null;
+  /** Settings → "Playful (jump on icons)". */
+  playful?: boolean;
 }
 
 /** ~30 Hz window moves — smooth enough, far cheaper than per-rAF IPC. */
@@ -109,7 +113,7 @@ function createWindowRoamDriver(): RoamDriver {
         lastSentY = Math.round(startY * scale);
         wantX = null;
         active = true;
-        return { left: Math.max(0, startX - minX), right: Math.max(0, maxX - startX) };
+        return { left: Math.max(0, startX - minX), right: Math.max(0, maxX - startX), centerX: startX + winW / 2 };
       } catch {
         return null; // browser preview / no window API
       }
@@ -161,6 +165,8 @@ export function Companion({
   roamAmount = "calm",
   roamPaused = false,
   reactKey = 0,
+  cue = null,
+  playful = false,
 }: Props) {
   const driverRef = useRef<RoamDriver | null>(null);
   if (!driverRef.current) driverRef.current = createWindowRoamDriver();
@@ -186,6 +192,8 @@ export function Companion({
           roamAmount={roamAmount}
           roamAllowed={!roamPaused && roamAmount !== "off"}
           reactKey={reactKey}
+          cue={cue}
+          playful={playful}
           roamDriver={driverRef}
         />
       </div>

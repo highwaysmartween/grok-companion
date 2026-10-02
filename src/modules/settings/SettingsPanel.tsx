@@ -56,6 +56,7 @@ export function SettingsPanel({ settings, models, onClose, onSaved, onClearChat,
   const [autostart, setAutostart] = useState(settings.autostart);
   const [roamAmount, setRoamAmount] = useState(normalizeRoamAmount(settings.roamAmount));
   const [wakeWordEnabled, setWakeWordEnabled] = useState(settings.wakeWordEnabled);
+  const [playful, setPlayful] = useState(!!settings.playful);
   const [autostartOs, setAutostartOs] = useState<boolean | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
@@ -91,6 +92,7 @@ export function SettingsPanel({ settings, models, onClose, onSaved, onClearChat,
           roamAmount !== "off" && roamAmount !== normalizeRoamAmount(settings.roamAmount) ? true : settings.roamEnabled,
         roamAmount,
         wakeWordEnabled,
+        playful,
       });
       autostartIsEnabled().then(setAutostartOs).catch(() => undefined);
       if (apiKey.trim()) {
@@ -237,6 +239,10 @@ export function SettingsPanel({ settings, models, onClose, onSaved, onClearChat,
           <label className="check">
             <input type="checkbox" checked={autostart} onChange={(e) => setAutostart(e.target.checked)} />
             Launch with Windows
+          </label>
+          <label className="check" title="Lets her walk over to desktop icons and jump on them (icon detection comes later)">
+            <input type="checkbox" checked={playful} onChange={(e) => setPlayful(e.target.checked)} />
+            Playful (jump on icons)
           </label>
         </div>
         <label>

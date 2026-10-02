@@ -26,6 +26,8 @@ export interface UseVoiceOptions {
   name?: string;
   /** Edge neural voice (default en-HK-YanNeural). */
   voice?: string;
+  /** The wake word was just heard (before the command is transcribed). */
+  onWake?: () => void;
 }
 
 /** Browser SpeechRecognition errors that mean "this engine won't work here" → use offline Windows STT. */
@@ -312,6 +314,7 @@ export function useVoice(opts: UseVoiceOptions) {
       setListening(true);
       setInterim("Mm? Go ahead…");
       playAck();
+      optsRef.current.onWake?.();
     })
       .then((fn) => {
         if (disposed) fn();

@@ -54,6 +54,8 @@ pub struct AppSettings {
     pub roam_amount: String,
     /// Background "hey" wake-word listener.
     pub wake_word_enabled: bool,
+    /// "Playful (jump on icons)": lets her walk over to desktop icons and pounce. Off by default.
+    pub playful: bool,
     /// Field-level default (0) so stores written before v1.1.1 get migrated once.
     #[serde(default)]
     pub settings_rev: u32,
@@ -80,6 +82,7 @@ impl Default for AppSettings {
             roam_enabled: true,
             roam_amount: DEFAULT_ROAM_AMOUNT.to_string(),
             wake_word_enabled: true,
+            playful: false,
             settings_rev: SETTINGS_REV,
         }
     }
@@ -147,6 +150,7 @@ pub struct PublicSettings {
     pub roam_enabled: bool,
     pub roam_amount: String,
     pub wake_word_enabled: bool,
+    pub playful: bool,
 }
 
 impl PublicSettings {
@@ -176,6 +180,7 @@ impl PublicSettings {
             roam_enabled: settings.roam_enabled,
             roam_amount: settings.roam_amount,
             wake_word_enabled: settings.wake_word_enabled,
+            playful: settings.playful,
         }
     }
 }
@@ -345,6 +350,21 @@ mod tests {
         let api = serde_json::json!({ "model": "grok-4.6", "brainProvider": "xai-api", "settingsRev": 2 });
         let s: AppSettings = serde_json::from_value(api).unwrap();
         assert_eq!(s.migrate().model, "grok-4.6");
+    }
+
+    #[test]
+    fn playful_defaults_off_and_round_trips() {
+        assert!(!AppSettings::default().playful);
+        let old = serde_json::json!({ "model": "grok-4.7", "settingsRev": 3 });
+        let s: AppSettings = serde_json::from_value(old).unwrap();
+        assert!(!s.migrate().playful);
+        let on = serde_json::json!({ "model": "grok-4.7", "playful": true, "settingsRev": 3 });
+        let s: AppSettings = serde_json::from_value(on).unwrap();
+        let s = s.migrate();
+        assert!(s.playful);
+        assert_eq!(s.model, "grok-4.7");
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["playful"], serde_json::json!(true));
     }
 
     #[test]

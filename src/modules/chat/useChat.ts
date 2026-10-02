@@ -24,7 +24,7 @@ function loadHistory(): ChatMessage[] {
 
 const capped = (list: ChatMessage[]) => (list.length > KEEP_HISTORY ? list.slice(-KEEP_HISTORY) : list);
 
-function emotionForReply(text: string): PetMood {
+export function emotionForReply(text: string): PetMood {
   const lower = text.toLowerCase();
   if (/sorry|error|can't|cannot|failed|unable|glitch/.test(lower)) return "error";
   if (/not sure|confused|unclear|what do you mean/.test(lower)) return "confused";
@@ -36,6 +36,8 @@ export interface ChatController {
   settings: PublicSettings | null;
   setMood: (mood: PetMood) => void;
   speakReply?: (text: string) => void;
+  /** Called once per finished brain reply with its text and the mood it set. */
+  onReply?: (text: string, mood: PetMood) => void;
 }
 
 const VOICE_FALLBACKS = [
@@ -128,7 +130,9 @@ export function useChat(controller: ChatController) {
         }
       });
       if (!aborting.current && assembled) {
-        setMood(emotionForReply(assembled));
+        const replyMood = emotionForReply(assembled);
+        setMood(replyMood);
+        ctrl.current.onReply?.(assembled, replyMood);
         if (wantSpeak) speakReply?.(assembled);
       } else if (!assembled) {
         const fallback = VOICE_FALLBACKS[Math.floor(Math.random() * VOICE_FALLBACKS.length)]!;

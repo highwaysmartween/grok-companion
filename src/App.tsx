@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { Companion, snapToFloor } from "./modules/pet/Companion";
-import { normalizeRoamAmount } from "./modules/pet/behaviour";
+import { normalizeRoamAmount, type GestureKind } from "./modules/pet/behaviour";
+import { gestureForReply } from "./modules/pet/gestures";
+import type { GestureCue } from "./modules/pet/CompanionVRM";
 import { ChatPanel } from "./modules/chat/ChatPanel";
 import { SettingsPanel } from "./modules/settings/SettingsPanel";
 import { StatusBar } from "./modules/status/StatusBar";
@@ -25,6 +27,8 @@ const FLASH_LINES = [
 const SLEEP_AFTER_MS = 120_000;
 const SETTLE_AFTER_MS = 25_000;
 const MOOD_TICK_MS = 3_000;
+/** Coming back after this long (no mouse / chat) earns a wave hello. */
+const RETURN_WAVE_AFTER_MS = 90_000;
 const TRANSIENT_MOODS: PetMood[] = ["happy", "confused", "annoyed", "sad", "error"];
 
 function classifyUserMood(raw: string): PetMood {
@@ -54,6 +58,12 @@ export default function App() {
   const [flash, setFlash] = useState(false);
   const [hovered, setHovered] = useState(false);
   const [reactKey, setReactKey] = useState(0);
+  const [cue, setCue] = useState<GestureCue | null>(null);
+  const cueSeq = useRef(0);
+  const fireCue = useCallback((kind: GestureKind) => {
+    cueSeq.current += 1;
+    setCue({ kind, id: cueSeq.current });
+  }, []);
   const preFlashIdx = useRef<number | null>(null);
   const restoredModel = useRef(false);
   const sendRef = useRef<(text: string, meta?: { fromVoice?: boolean }) => Promise<void>>(async () => undefined);
@@ -74,13 +84,22 @@ export default function App() {
     wakeWord: "hey",
     name,
     voice: settings?.voiceTarget,
+    onWake: () => fireCue("wave"),
     onFinalTranscript: (text) => {
       setInput("");
       touchMood(classifyUserMood(text));
       void sendRef.current(text, { fromVoice: true });
     },
   });
-  const chat = useChat({ settings, setMood: touchMood, speakReply: (text) => voice.speak(plainForSpeech(text)) });
+  const chat = useChat({
+    settings,
+    setMood: touchMood,
+    speakReply: (text) => voice.speak(plainForSpeech(text)),
+    onReply: (text, replyMood) => {
+      const g = gestureForReply(text, replyMood);
+      if (g) fireCue(g);
+    },
+  });
 
   const persist = useCallback(async (patch: Partial<Parameters<typeof toPayload>[1]>) => {
     const s = settingsRef.current;
@@ -106,6 +125,7 @@ export default function App() {
       }
       setFlash(true);
       touchMood("happy");
+      fireCue("kiss");
       voice.speak(FLASH_LINES[Math.floor(Math.random() * FLASH_LINES.length)]!);
       return;
     }
@@ -116,12 +136,13 @@ export default function App() {
         preFlashIdx.current = null;
       }
       touchMood("happy");
+      fireCue("kiss");
       voice.speak("Whatever. Clothes back on.");
       return;
     }
     touchMood(classifyUserMood(text));
     await chat.send(text, meta);
-  }, [chat, voice, modelsCatalog, modelIdx, touchMood]);
+  }, [chat, voice, modelsCatalog, modelIdx, touchMood, fireCue]);
 
   sendRef.current = handleUserText;
 
@@ -153,9 +174,11 @@ export default function App() {
     const now = Date.now();
     if (now - lastMoveBump.current < 1000) return;
     lastMoveBump.current = now;
+    const away = now - lastInteractionRef.current;
     lastInteractionRef.current = now;
+    if (away > RETURN_WAVE_AFTER_MS) fireCue("wave");
     setMood((cur) => (cur === "sleeping" ? "idle" : cur));
-  }, []);
+  }, [fireCue]);
 
   useEffect(() => {
     void fetch("/models/catalog.json").then((r) => r.json()).then((list: ModelOpt[]) => {
@@ -272,7 +295,7 @@ export default function App() {
       <button type="button" onClick={() => void getCurrentWindow().hide()} title="Hide to tray (Quit from the tray icon)">×</button>
     </div></header>
     <div className="companion-click-target" onClick={() => { setReactKey((k) => k + 1); bumpActivity(); if (compact) setChatOpen(true); }} title="Open companion chat">
-      <Companion mood={mood} name={name} compact={compact} modelUrl={modelsCatalog[modelIdx]?.file} flash={flash} roamAmount={roamAmount} roamPaused={roamPaused} reactKey={reactKey} />
+      <Companion mood={mood} name={name} compact={compact} modelUrl={modelsCatalog[modelIdx]?.file} flash={flash} roamAmount={roamAmount} roamPaused={roamPaused} reactKey={reactKey} cue={cue} playful={!!settings?.playful} />
     </div>
     {!compact && <StatusBar connection={connection} connectionMessage={connectionMessage} mood={mood} listening={voice.listening} speaking={voice.speaking} busy={chat.busy} wakeArmed={voice.wakeArmed} interim={voice.interim} />}
     {(!compact || chatOpen) && <div className={compact ? "compact-chat" : "full-chat"}>

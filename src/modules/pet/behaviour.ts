@@ -15,63 +15,67 @@
  */
 
 export type RoamAmount = "off" | "calm" | "lively";
+/** One-shot gestures the app can request (see CompanionVRM `cue`). */
+export type GestureKind = "wave" | "kiss" | "joy" | "jump";
 export const DEFAULT_ROAM_AMOUNT: RoamAmount = "calm";
 
 export function normalizeRoamAmount(v: unknown): RoamAmount {
   return v === "off" || v === "lively" || v === "calm" ? v : DEFAULT_ROAM_AMOUNT;
 }
 
-/** Clip keys the behaviour layer may ask for (superset of what ships today). */
-export type ClipKey =
-  | "idle"
-  | "walk"
-  | "look"
-  | "wave"
-  | "talk"
-  | "think"
-  | "sit"
-  | "sleep"
-  | "stretch"
-  | "jump"
-  | "pounce";
+export type { ClipKey } from "./clips";
+import type { ClipKey } from "./clips";
 
 /**
  * Self-directed activities picked after an idle dwell. Reactive states
- * (attend-to-user, react, sleep) are driven by mood/cursor in CompanionVRM and
- * always win over these.
+ * (attend-to-user, gestures, sleep) are driven by mood/cursor/cues in
+ * CompanionVRM and always win over these.
  */
 export type ActivityId =
-  | "idle" // keep standing, breathe, glance
-  | "lookAround" // head scan (Looking_Around clip if present, else procedural)
+  | "idle" // keep standing (Breathing_Idle / Happy_Idle), breathe, glance
+  | "lookAround" // Looking_Around once (procedural head scan if missing)
+  | "stretch" // Arm_Stretching once
   | "turn" // turn in place a little, hold, turn back
   | "stroll" // one short walk to one target
-  | "stretch" // one-shot gesture (needs Stretch.fbx)
-  | "sit" // sit for a while (needs Sitting.fbx)
-  | "hop" // one-shot jump/pounce (needs Jump.fbx / Pounce.fbx), lively only
-  | "visitIcon"; // walk to a desktop icon — hook only, see visitDesktopIcon()
+  | "sit" // Stand_To_Sit → Sitting_Idle (20-90 s) → Sit_To_Stand
+  | "hop" // Standing_Jump, Lively only, rare
+  | "visitIcon"; // walk to a desktop icon and pounce — Playful only, see visitDesktopIcon()
+
+/** Activities that count as an idle "variation" (never picked twice in a row). */
+export const VARIATIONS: ReadonlySet<ActivityId> = new Set<ActivityId>(["lookAround", "stretch", "turn", "sit", "hop"]);
 
 export interface ActivityDef {
   id: ActivityId;
-  /** Any one of these clips must be loaded for the activity to be eligible. */
+  /** All of these clips must be loaded for the activity to be eligible. */
   requires?: ClipKey[];
   /** Relative pick weight per roam profile. */
   weight: Record<RoamAmount, number>;
-  /** Seconds the activity lasts (for timed ones; strolls compute their own). */
+  /** Seconds the activity lasts (timed ones; clip-driven ones use the clip length). */
   duration?: [number, number];
   /** Needs window movement (disabled when roam is Off or the host can't move). */
   moves?: boolean;
+  /** Only after this many seconds without any interaction. */
+  minIdleFor?: number;
+  /** Only when Settings → "Playful (jump on icons)" is on. */
+  playfulOnly?: boolean;
 }
 
 export const ACTIVITIES: ActivityDef[] = [
   { id: "idle", weight: { off: 0.55, calm: 0.42, lively: 0.28 } },
-  { id: "lookAround", duration: [3, 5.5], weight: { off: 0.25, calm: 0.2, lively: 0.18 } },
-  { id: "turn", duration: [2.5, 4.5], weight: { off: 0.15, calm: 0.12, lively: 0.12 } },
-  { id: "stroll", moves: true, weight: { off: 0, calm: 0.2, lively: 0.34 } },
-  { id: "stretch", requires: ["stretch"], weight: { off: 0.05, calm: 0.06, lively: 0.06 } },
-  { id: "sit", requires: ["sit"], duration: [12, 30], weight: { off: 0.08, calm: 0.08, lively: 0.04 } },
-  { id: "hop", requires: ["jump", "pounce"], weight: { off: 0, calm: 0, lively: 0.05 } },
-  // TODO(visit-icon): give this a weight once visitDesktopIcon() is implemented.
-  { id: "visitIcon", moves: true, weight: { off: 0, calm: 0, lively: 0 } },
+  { id: "lookAround", duration: [3.5, 5.5], weight: { off: 0.22, calm: 0.18, lively: 0.15 } },
+  { id: "stretch", requires: ["stretch"], weight: { off: 0.07, calm: 0.08, lively: 0.08 } },
+  { id: "turn", duration: [2.5, 4.5], weight: { off: 0.12, calm: 0.1, lively: 0.1 } },
+  { id: "stroll", moves: true, weight: { off: 0, calm: 0.2, lively: 0.32 } },
+  {
+    id: "sit",
+    requires: ["sitDown", "sit", "standUp"],
+    duration: [20, 90],
+    minIdleFor: 45,
+    weight: { off: 0, calm: 0.12, lively: 0.07 },
+  },
+  { id: "hop", requires: ["jump"], weight: { off: 0, calm: 0, lively: 0.03 } },
+  // Resolves to idle until locateDesktopIcons() returns real targets.
+  { id: "visitIcon", moves: true, playfulOnly: true, requires: ["walk"], weight: { off: 0, calm: 0.04, lively: 0.07 } },
 ];
 
 export interface RoamProfile {
@@ -158,13 +162,27 @@ export interface PickContext {
   canMove: boolean;
   /** Strolls done since the last full idle dwell. */
   strollsInRow: number;
+  /** Last idle variation played (never repeated back-to-back). */
+  lastVariation?: ActivityId | null;
+  /** Seconds since the user last interacted (hover, click, talk). */
+  idleFor?: number;
+  playful?: boolean;
 }
 
 function eligible(def: ActivityDef, ctx: PickContext): boolean {
   if (def.moves && (!ctx.canMove || ctx.amount === "off")) return false;
   if (def.id === "stroll" && ctx.strollsInRow >= ROAM_PROFILES[ctx.amount].maxStrollsInRow) return false;
-  if (def.requires && !def.requires.some((c) => ctx.clips.has(c))) return false;
+  if (def.requires && !def.requires.every((c) => ctx.clips.has(c))) return false;
+  if (def.minIdleFor && (ctx.idleFor ?? 0) < def.minIdleFor) return false;
+  if (def.playfulOnly && !ctx.playful) return false;
+  if (ctx.lastVariation && def.id === ctx.lastVariation && VARIATIONS.has(def.id)) return false;
   return def.weight[ctx.amount] > 0;
+}
+
+/** Which standing idle loop to use for the next dwell (Breathing_Idle is primary). */
+export function pickIdleBase(clips: ReadonlySet<ClipKey>, happy: boolean, rng: Rng = Math.random): "idle" | "happyIdle" {
+  if (!clips.has("happyIdle")) return "idle";
+  return rng() < (happy ? 0.5 : 0.2) ? "happyIdle" : "idle";
 }
 
 /** Weighted pick of the next self-directed activity (always returns something). */
@@ -195,6 +213,8 @@ export interface Room {
   /** Free logical px to the left / right of the window inside the work area. */
   left: number;
   right: number;
+  /** Window centre, screen logical px (for icon visits). */
+  centerX?: number;
 }
 
 export interface StrollPlan {
@@ -322,25 +342,50 @@ export interface RoamDriver {
   end(): void;
 }
 
-/** A desktop icon she could wander over to (screen logical px). */
+/** A desktop icon she could wander over to (screen logical px, icon centre). */
 export interface DesktopIconTarget {
   label: string;
   x: number;
   y: number;
 }
 
+/** What the pet does for an icon visit: walk `dx` px, then pounce (jump) on it. */
+export interface IconVisitPlan {
+  dir: 1 | -1;
+  distance: number;
+  action: "pounce";
+}
+
 /**
- * Hook: walk over to a desktop icon and "inspect" it.
+ * TODO(visit-icon): Rust command listing desktop icon positions (Windows:
+ * SysListView32 under Progman/WorkerW "FolderView", LVM_GETITEMPOSITION +
+ * LVM_GETITEMTEXT), filtered to icons on her floor line. Returns [] until then.
+ */
+export async function locateDesktopIcons(): Promise<DesktopIconTarget[]> {
+  return [];
+}
+
+/**
+ * Hook: plan a walk over to a desktop icon and pounce on it. The animation
+ * side (approach stroll → Joyful_Jump / Standing_Jump on arrival) is
+ * implemented in CompanionVRM; only icon discovery is missing, so this
+ * resolves null and the activity falls back to idle.
  *
- * TODO(visit-icon): needs a Rust command that lists desktop icon positions
- * (Windows: SysListView32 in the Progman/WorkerW "FolderView", LVM_GETITEMPOSITION),
- * then plan one stroll whose target x is the icon, play look/sit/pounce on
- * arrival. The ACTIVITIES entry has weight 0 until this resolves true.
+ * @param windowCenterX her current window centre (screen logical px)
+ * @param room          free px left / right of the window
  */
 export async function visitDesktopIcon(
-  _driver: RoamDriver,
-  _target: DesktopIconTarget | null,
-  _amount: RoamAmount,
-): Promise<boolean> {
-  return false;
+  windowCenterX: number,
+  room: Room,
+  amount: RoamAmount,
+): Promise<IconVisitPlan | null> {
+  if (amount === "off") return null;
+  const icons = await locateDesktopIcons();
+  // TODO(visit-icon): pick the nearest reachable icon on her floor line.
+  const target = icons.find((i) => Math.abs(i.x - windowCenterX) <= Math.max(room.left, room.right));
+  if (!target) return null;
+  const dx = target.x - windowCenterX;
+  const dir: 1 | -1 = dx >= 0 ? 1 : -1;
+  const distance = Math.min(Math.abs(dx), dir > 0 ? room.right : room.left);
+  return distance >= 40 ? { dir, distance, action: "pounce" } : null;
 }

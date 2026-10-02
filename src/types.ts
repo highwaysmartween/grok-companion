@@ -43,6 +43,8 @@ export interface PublicSettings {
   /** "off" | "calm" | "lively" */
   roamAmount: string;
   wakeWordEnabled: boolean;
+  /** "Playful (jump on icons)" — default off. */
+  playful: boolean;
 }
 
 export interface SettingsPayload {
@@ -63,6 +65,8 @@ export interface SettingsPayload {
   /** "off" | "calm" | "lively" */
   roamAmount: string;
   wakeWordEnabled: boolean;
+  /** "Playful (jump on icons)" — default off. */
+  playful: boolean;
 }
 
 export interface ConnectionStatus {

@@ -7,7 +7,8 @@ import type { VRM, VRMHumanBoneName } from "@pixiv/three-vrm";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { PetMood } from "../../types";
-import { clipRootSpeed, loadMixamoAnimation } from "./loadMixamoAnimation";
+import { clipGaitSpeed, loadMixamoAnimation, UPPER_BODY_BONES } from "./loadMixamoAnimation";
+import { CLIPS, CLIP_KEYS, type ClipKey } from "./clips";
 import {
   ROAM_PROFILES,
   STROLL_TIMING,
@@ -15,17 +16,26 @@ import {
   activityDuration,
   makeStrollMotion,
   pickActivity,
+  pickIdleBase,
   planStroll,
   rand,
   randIn,
   shouldChainStroll,
   solveGait,
+  visitDesktopIcon,
+  VARIATIONS,
   type ActivityId,
-  type ClipKey,
+  type GestureKind,
   type RoamAmount,
   type RoamDriver,
   type StrollMotion,
 } from "./behaviour";
+
+export interface GestureCue {
+  kind: GestureKind;
+  /** Monotonic id; a cue is played once per id (survives model swaps). */
+  id: number;
+}
 
 interface Props {
   mood: PetMood;
@@ -37,40 +47,22 @@ interface Props {
   roamAmount?: RoamAmount;
   /** Strolls allowed right now (not paused by hover / chat / tray). */
   roamAllowed?: boolean;
+  /** Settings → "Playful (jump on icons)". */
+  playful?: boolean;
   /** Bump to trigger a one-shot reaction (wave / nod). */
   reactKey?: number;
+  /** One-shot gesture requests from the app (wave on wake word, kiss on flirty replies…). */
+  cue?: GestureCue | null;
   /** Host that moves the transparent Tauri window during a stroll. */
   roamDriver?: MutableRefObject<RoamDriver | null>;
 }
 
-/**
- * Clips. Only Idle.fbx + Walking.fbx ship today; everything else is optional and
- * picked up automatically if dropped into public/animations/ later. Missing clips
- * fall back to procedural motion (look-at, breathing, nods, sleep pose).
- */
-const ANIM: Record<ClipKey, readonly string[]> = {
-  idle: ["/animations/Happy_Idle.fbx", "/animations/Idle.fbx"],
-  look: ["/animations/Looking_Around.fbx"],
-  walk: ["/animations/Walking.fbx"],
-  wave: ["/animations/Waving.fbx"],
-  talk: ["/animations/Talking_2.fbx"],
-  think: ["/animations/Thinking.fbx"],
-  sit: ["/animations/Sitting.fbx"],
-  sleep: ["/animations/Sleeping.fbx"],
-  stretch: ["/animations/Stretch.fbx", "/animations/Stretching.fbx"],
-  jump: ["/animations/Jump.fbx"],
-  pounce: ["/animations/Pounce.fbx"],
-};
-/** Clips that play once (everything else loops). */
-const ONE_SHOT: ReadonlySet<ClipKey> = new Set<ClipKey>(["wave", "stretch", "jump", "pounce"]);
-/** Clips whose root motion is pinned so the window (not the clip) carries her. */
-const IN_PLACE: ReadonlySet<ClipKey> = new Set<ClipKey>(["walk", "jump", "pounce"]);
-
-export const PET_VRM_VERSION = 18;
+export const PET_VRM_VERSION = 19;
 
 /** Reactive modes override the self-directed activity loop (see behaviour.ts). */
 type Mode = "activity" | "attend" | "react" | "sleep";
-type StrollPhase = "measure" | "turn" | "prePause" | "walk" | "stopping" | "postPause" | "turnBack";
+type Posture = "stand" | "sit" | "lie";
+type StrollPhase = "measure" | "turn" | "prePause" | "walk" | "stopping" | "pounce" | "postPause" | "turnBack";
 interface Stroll {
   phase: StrollPhase;
   phaseAt: number;
@@ -88,7 +80,42 @@ interface Stroll {
   /** Driver.begin() resolved after we gave up → release on arrival. */
   dropped: boolean;
   fadedOut: boolean;
+  /** Icon visit: pounce (jump) on arrival. */
+  pounce: boolean;
+  /** Debug / icon visit: exact distance + direction instead of a random plan. */
+  forced?: { dir: 1 | -1; distance: number };
 }
+/** A one-shot clip in flight (LoopOnce + clampWhenFinished, then back to the base state). */
+interface Shot {
+  key: ClipKey;
+  end: number;
+  fadeOut: number;
+  /** Idle variations (look-around, stretch) yield to the user immediately. */
+  interruptible: boolean;
+  onDone?: () => void;
+}
+interface Transition {
+  kind: "sitDown" | "standUp" | "lieDown" | "getUp";
+  end: number;
+  onDone?: () => void;
+}
+
+/** Upper-body Talking layer weight (base pose keeps the legs; ~half the upper body). */
+const TALK_LAYER_WEIGHT = 1.1;
+/** Cues older than this are dropped rather than played late. */
+const CUE_TTL = 10;
+const WAVE_COOLDOWN = 30;
+/** Background clip prefetch order after the startup set (most likely needed first). */
+const PREFETCH: ClipKey[] = ["wave", "think", "talk", "kiss", "happyIdle", "look", "stretch", "sitDown", "sit", "standUp", "sleep", "joyJump", "jump"];
+const PREFETCH_GAP_MS = 450;
+/** Lying framing: camera pulls back so the whole body fits the portrait window. */
+const LIE_ZOOM = 0.5;
+
+// Session-wide (survive model swaps / remounts).
+let greetedThisSession = false;
+let lastHandledCue = 0;
+/** DEV-only roam-amount override for the headless check (the browser preview has no settings). */
+let debugRoam: RoamAmount | null = null;
 
 /** Lightweight rendering for Iris Xe-class GPUs. */
 const TARGET_FPS = 30;
@@ -148,17 +175,6 @@ function setClothVisible(root: THREE.Object3D, visible: boolean) {
   });
 }
 
-async function tryLoadClip(urls: readonly string[], vrm: VRM, inPlace: boolean): Promise<THREE.AnimationClip | null> {
-  for (const url of urls) {
-    try {
-      return await loadMixamoAnimation(url, vrm, { inPlace });
-    } catch {
-      // Missing / not-a-Mixamo file → next candidate, then procedural fallback.
-    }
-  }
-  return null;
-}
-
 /** Mood → target expression weights (only applied when the model has them). */
 function moodExpressions(m: PetMood, flash: boolean): Record<string, number> {
   const base: Record<string, number> = { happy: 0, relaxed: 0, sad: 0, angry: 0, surprised: 0 };
@@ -209,12 +225,17 @@ const damp = (cur: number, target: number, rate: number, dt: number) =>
 
 type CursorSample = { x: number; y: number; width: number; height: number; inside: boolean; movedAt: number };
 
+const gestureClip = (k: GestureKind): ClipKey =>
+  k === "wave" ? "wave" : k === "kiss" ? "kiss" : k === "joy" ? "joyJump" : "jump";
+
 /**
  * VRM + Mixamo clips + procedural life layer:
- *  - behaviour: reactive modes (attend / react / sleep) over a calm activity
- *    loop (idle / look-around / turn / stroll …) defined in behaviour.ts
- *  - head/neck/chest look-at that follows the global cursor
- *  - breathing + weight shift, mood → expressions, talking mouth
+ *  - postures (stand / sit / lie) with real transitions (Stand_To_Sit, Sit_To_Stand)
+ *  - base loops (Breathing_Idle, Happy_Idle, Thinking, Sitting_Idle, Laying_Sleeping)
+ *  - one-shots (wave, kiss, jumps, stretch, look-around) that always settle back
+ *  - upper-body Talking layer while she speaks
+ *  - reactive modes (attend / react / sleep) over the calm activity loop in behaviour.ts
+ *  - head/neck look-at following the global cursor, breathing, expressions, mouth
  * Clean neutral lighting: NoToneMapping + white lights (no ACES, no warm/cheek/rim hacks).
  */
 export function CompanionVRM({
@@ -224,7 +245,9 @@ export function CompanionVRM({
   flash = false,
   roamAmount = "calm",
   roamAllowed = true,
+  playful = false,
   reactKey = 0,
+  cue = null,
   roamDriver,
 }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -232,25 +255,24 @@ export function CompanionVRM({
   const flashRef = useRef(flash);
   const roamAmountRef = useRef(roamAmount);
   const roamAllowedRef = useRef(roamAllowed);
+  const playfulRef = useRef(playful);
   const reactKeyRef = useRef(reactKey);
+  const cueRef = useRef(cue);
   const vrmRef = useRef<VRM | null>(null);
   const roamDriverRef = useRef(roamDriver);
-  const prevFlashRef = useRef(false); // false so mount-with-flash (r18 switch) still fires gesture
-  const flashGestureRef = useRef(false);
   moodRef.current = mood;
   flashRef.current = flash;
-  roamAmountRef.current = roamAmount;
-  roamAllowedRef.current = roamAllowed;
+  roamAmountRef.current = (import.meta.env.DEV && debugRoam) || roamAmount;
+  roamAllowedRef.current = (import.meta.env.DEV && debugRoam !== null) || roamAllowed;
+  playfulRef.current = playful;
   reactKeyRef.current = reactKey;
+  cueRef.current = cue;
   roamDriverRef.current = roamDriver;
 
   useEffect(() => {
     const v = vrmRef.current;
     if (!v) return;
     setClothVisible(v.scene, !flash);
-    // Rising edge → request a one-shot upper-body gesture (approximation).
-    if (flash && !prevFlashRef.current) flashGestureRef.current = true;
-    prevFlashRef.current = flash;
   }, [flash]);
 
   useEffect(() => {
@@ -294,28 +316,48 @@ export function CompanionVRM({
     let vrm: VRM | null = null;
     let mixer: THREE.AnimationMixer | null = null;
     const actions: Partial<Record<ClipKey, THREE.AnimationAction>> = {};
+    const loadedClips = new Set<ClipKey>();
+    const failedClips = new Set<ClipKey>();
+    const loading = new Map<ClipKey, Promise<boolean>>();
     let current: ClipKey | null = null;
     let frame = 0;
     let disposed = false;
     let paused = false;
+    let ready = false;
     let mirror = 1; // VRM0 normalized rig: x/z rotations flip sign
     const available = new Set<string>();
-    const loadedClips = new Set<ClipKey>();
-    /** Walking.fbx root travel before pinning (VRM m/s); drives foot-locking. */
-    let walkRootSpeed = 0;
+    /** Walk clip ground speed (VRM m/s, measured from the planted foot). */
+    let walkGait = 0;
+    /** Lying pose: root drop so her back rests on the floor, and body centre along z. */
+    let lieDrop = 0;
+    let lieCenterZ = 0;
 
     // --- behaviour state ---------------------------------------------------
     let t = 0;
     let mode: Mode = "activity";
     let modeUntil = 0;
+    let posture: Posture = "stand";
     let activity: ActivityId = "idle";
     let actUntil = rand(8, 14);
+    let lastVariation: ActivityId | null = null;
+    let idleBase: "idle" | "happyIdle" = "idle";
     let turnBackAt = 0;
     let strollsInRow = 0;
     let forceStrollNext = false;
     let stroll: Stroll | null = null;
+    let shot: Shot | null = null;
+    let transition: Transition | null = null;
+    let pendingCue: { kind: GestureKind; at: number } | null = null;
+    let lastWaveAt = -1e9;
+    let greetAt = -1;
+    let lastInteractT = 0;
+    let talkW = 0;
     /** Body yaw from deliberate turns (stroll heading, turn-in-place). */
     const bodyTurn = new Tween();
+    /** 0 = upright framing, 1 = lying (root turned side-on, dropped, camera pulled back). */
+    const lieTween = new Tween();
+    let lieSide: 1 | -1 = 1;
+    let lastLie = -1;
     let driftYaw = 0;
     let modelHeight = 1.5;
     const camTarget = new THREE.Vector3(0, 0.95, 0);
@@ -330,6 +372,9 @@ export function CompanionVRM({
     let lookYaw = 0;
     let lookPitch = 0;
     let sleepBlend = 0;
+    /** DEV-only: force a mood without the app (headless checks). */
+    let debugMood: PetMood | null = null;
+    const effMood = (): PetMood => debugMood ?? moodRef.current;
 
     const cursor: CursorSample = { x: 0, y: 0, width: 1, height: 1, inside: false, movedAt: -1e9 };
 
@@ -344,10 +389,11 @@ export function CompanionVRM({
     const ro = new ResizeObserver(resize);
     ro.observe(el);
 
-    const crossfade = (to: ClipKey, fade = 0.35) => {
+    // --- clips -----------------------------------------------------------------
+    const crossfade = (to: ClipKey, fade = 0.5) => {
       const next = actions[to];
-      if (!next) return false;
-      if (to === current && next.isRunning()) return true;
+      if (!next || to === "talk") return false;
+      if (to === current && next.isRunning() && !next.paused) return true;
       const prev = current ? actions[current] : undefined;
       next.reset().setEffectiveWeight(1).fadeIn(fade).play();
       if (prev && prev !== next) prev.fadeOut(fade);
@@ -355,29 +401,251 @@ export function CompanionVRM({
       return true;
     };
 
-    const playOnce = (k: ClipKey, then: ClipKey = "idle") => {
+    const idleKey = (): ClipKey => (actions[idleBase] ? idleBase : "idle");
+    /** The loop she returns to after any one-shot or transition. */
+    const baseClip = (): ClipKey => {
+      if (posture === "lie") return actions.sleep ? "sleep" : actions.sit ? "sit" : idleKey();
+      if (posture === "sit") return actions.sit ? "sit" : idleKey();
+      if (effMood() === "thinking" && actions.think) return "think";
+      return idleKey();
+    };
+    const settleBase = (fade = 0.5) => crossfade(baseClip(), fade);
+
+    const rootLocal = new THREE.Vector3();
+    const PROBE_BONES: VRMHumanBoneName[] = ["hips", "head", "chest", "leftHand", "rightHand", "leftFoot", "rightFoot", "leftLowerLeg", "rightLowerLeg", "leftLowerArm", "rightLowerArm"];
+    /**
+     * Sanity-check a retargeted clip on the live rig (between frames): NaNs,
+     * limbs flying off (explosion) or a stuck T-pose → drop it from the pool.
+     */
+    const validateClip = (k: ClipKey, clip: THREE.AnimationClip): string | null => {
+      const v = vrm;
+      if (!v) return "no model";
+      const tmp = new THREE.AnimationMixer(v.scene);
+      const act = tmp.clipAction(clip);
+      act.play();
+      let problem: string | null = null;
+      let tposeHits = 0;
+      let minY = Infinity;
+      let zMin = Infinity;
+      let zMax = -Infinity;
+      const hp = new THREE.Vector3();
+      const a = new THREE.Vector3();
+      const b = new THREE.Vector3();
+      const spine = new THREE.Vector3();
+      const samples = [0.1, 0.35, 0.6, 0.9];
+      for (const u of samples) {
+        tmp.setTime(clip.duration * u);
+        v.humanoid.update();
+        v.scene.updateMatrixWorld(true);
+        const hips = v.humanoid.getRawBoneNode("hips");
+        const neck = v.humanoid.getRawBoneNode("neck") ?? v.humanoid.getRawBoneNode("head");
+        if (!hips || !neck) return "missing hips/neck";
+        root.worldToLocal(hips.getWorldPosition(hp));
+        root.worldToLocal(neck.getWorldPosition(spine)).sub(hp).normalize();
+        for (const n of PROBE_BONES) {
+          const node = v.humanoid.getRawBoneNode(n);
+          if (!node) continue;
+          root.worldToLocal(node.getWorldPosition(rootLocal));
+          if (!Number.isFinite(rootLocal.x + rootLocal.y + rootLocal.z)) problem = "NaN pose";
+          else if (rootLocal.distanceTo(hp) > modelHeight * 1.2) problem = `${n} flies off`;
+          minY = Math.min(minY, rootLocal.y);
+          zMin = Math.min(zMin, rootLocal.z);
+          zMax = Math.max(zMax, rootLocal.z);
+        }
+        let horiz = 0;
+        for (const side of ["left", "right"] as const) {
+          const up = v.humanoid.getRawBoneNode(`${side}UpperArm`);
+          const lo = v.humanoid.getRawBoneNode(`${side}LowerArm`);
+          if (!up || !lo) continue;
+          up.getWorldPosition(a);
+          lo.getWorldPosition(b);
+          if (Math.abs(b.sub(a).normalize().dot(spine)) < 0.2) horiz++;
+        }
+        if (horiz === 2) tposeHits++;
+      }
+      act.stop();
+      tmp.uncacheRoot(v.scene);
+      if (!problem && tposeHits === samples.length) problem = "stuck in T-pose";
+      if (!problem && k === "sleep") {
+        lieDrop = -(minY - modelHeight * 0.04);
+        lieCenterZ = (zMin + zMax) / 2;
+      }
+      return problem;
+    };
+
+    /** Start loading a clip (once). True if it's ready right now. */
+    const ensureClip = (k: ClipKey): boolean => {
+      if (actions[k]) return true;
+      if (failedClips.has(k) || loading.has(k) || !vrm || !mixer || disposed) return false;
+      const v = vrm;
+      const def = CLIPS[k];
+      const job = (async () => {
+        for (const url of def.urls) {
+          try {
+            const clip = await loadMixamoAnimation(url, v, {
+              root: def.root,
+              measureGait: def.measureGait,
+              onlyBones: def.upperBody ? UPPER_BODY_BONES : undefined,
+            });
+            if (disposed || !mixer || vrm !== v) return false;
+            const bad = def.upperBody ? null : validateClip(k, clip);
+            if (bad) {
+              console.warn(`[pet] clip "${k}" (${url}) dropped: ${bad}`);
+              continue;
+            }
+            const act = mixer.clipAction(clip);
+            if (def.once) {
+              const reps = def.repeat ?? 1;
+              act.setLoop(reps > 1 ? THREE.LoopRepeat : THREE.LoopOnce, reps);
+              act.clampWhenFinished = true;
+            } else {
+              act.setLoop(THREE.LoopRepeat, Infinity);
+            }
+            if (k === "walk") walkGait = clipGaitSpeed(clip);
+            actions[k] = act;
+            loadedClips.add(k);
+            return true;
+          } catch (err) {
+            console.warn(`[pet] clip "${k}" (${url}) failed to load/retarget`, err);
+          }
+        }
+        failedClips.add(k);
+        return false;
+      })().finally(() => loading.delete(k));
+      loading.set(k, job);
+      return false;
+    };
+
+    const prefetch = async () => {
+      for (const k of PREFETCH) {
+        if (disposed) return;
+        if (actions[k] || failedClips.has(k)) continue;
+        ensureClip(k);
+        await loading.get(k);
+        await new Promise<void>((r) => window.setTimeout(r, PREFETCH_GAP_MS));
+      }
+    };
+
+    // --- one-shots, postures ------------------------------------------------
+    /** LoopOnce + clamp, then crossfade back to the base loop. Never while walking. */
+    const startShot = (
+      k: ClipKey,
+      o: { fadeIn?: number; fadeOut?: number; maxDur?: number; timeScale?: number; interruptible?: boolean; onDone?: () => void } = {},
+    ) => {
       const act = actions[k];
       if (!act) {
-        crossfade(then);
+        ensureClip(k);
         return false;
       }
-      act.reset();
-      act.setLoop(THREE.LoopOnce, 1);
-      act.clampWhenFinished = true;
-      crossfade(k, 0.25);
-      const onFinished = (e: { action: THREE.AnimationAction }) => {
-        if (e.action !== act) return;
-        mixer?.removeEventListener("finished", onFinished);
-        act.setLoop(THREE.LoopRepeat, Infinity);
-        if (current === k) crossfade(actions[then] ? then : "idle", 0.35);
+      act.timeScale = o.timeScale ?? 1;
+      if (!crossfade(k, o.fadeIn ?? 0.45)) return false;
+      const len = (act.getClip().duration * (CLIPS[k].repeat ?? 1)) / act.timeScale;
+      shot = {
+        key: k,
+        end: t + Math.min(len, o.maxDur ?? Infinity),
+        fadeOut: o.fadeOut ?? 0.5,
+        interruptible: !!o.interruptible,
+        onDone: o.onDone,
       };
-      mixer?.addEventListener("finished", onFinished);
       return true;
+    };
+    const playShot = (k: ClipKey, o: Parameters<typeof startShot>[1] = {}) =>
+      !stroll && !transition && posture === "stand" && startShot(k, o);
+
+    const endShot = (fade: number) => {
+      const s = shot;
+      if (!s) return;
+      shot = null;
+      s.onDone?.();
+      if (!shot && !transition && current === s.key) settleBase(fade);
+    };
+
+    const sitDown = (onDone?: () => void) => {
+      const a = actions.sitDown;
+      if (!a || !actions.sit || !actions.standUp || posture !== "stand") return false;
+      shot = null;
+      if (Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 0.5);
+      crossfade("sitDown", 0.5);
+      transition = {
+        kind: "sitDown",
+        end: t + a.getClip().duration - 0.35,
+        onDone: () => {
+          posture = "sit";
+          crossfade("sit", 0.45);
+          onDone?.();
+        },
+      };
+      return true;
+    };
+
+    const standUp = (onDone?: () => void) => {
+      if (posture !== "sit") {
+        onDone?.();
+        return;
+      }
+      const a = actions.standUp;
+      if (!a) {
+        posture = "stand";
+        settleBase(0.8);
+        onDone?.();
+        return;
+      }
+      crossfade("standUp", 0.4);
+      transition = {
+        kind: "standUp",
+        end: t + a.getClip().duration - 0.4,
+        onDone: () => {
+          posture = "stand";
+          crossfade(baseClip(), 0.5);
+          onDone?.();
+        },
+      };
+    };
+
+    const lieDown = () => {
+      if (posture === "lie") return;
+      if (posture === "stand") {
+        // Sit first so lying back reads naturally; without sit clips doze standing.
+        if (sitDown(() => effMood() === "sleeping" && lieDown())) return;
+        if (!actions.sleep) return;
+      }
+      if (!actions.sleep) return; // seated doze (procedural head droop)
+      lieSide = Math.random() < 0.5 ? 1 : -1;
+      crossfade("sleep", 2.0);
+      lieTween.set(1, t, 2.2);
+      transition = { kind: "lieDown", end: t + 2.2, onDone: () => (posture = "lie") };
+    };
+
+    const getUp = (onDone?: () => void) => {
+      if (posture === "lie") {
+        lieTween.set(0, t, 1.8);
+        const toSit = !!(actions.sit && actions.standUp);
+        crossfade(toSit ? "sit" : idleKey(), 1.6);
+        transition = {
+          kind: "getUp",
+          end: t + 1.8,
+          onDone: () => {
+            posture = toSit ? "sit" : "stand";
+            if (toSit) standUp(onDone);
+            else onDone?.();
+          },
+        };
+        return;
+      }
+      if (posture === "sit") standUp(onDone);
+      else onDone?.();
     };
 
     const enterMode = (next: Mode, duration: number) => {
       mode = next;
       modeUntil = t + duration;
+    };
+
+    const queueCue = (kind: GestureKind) => {
+      if (kind === "wave" && t - lastWaveAt < WAVE_COOLDOWN) return;
+      pendingCue = { kind, at: t };
+      lastInteractT = t;
+      ensureClip(gestureClip(kind));
     };
 
     // --- cursor polling (global cursor via Rust; DOM fallback in browser preview) ---
@@ -420,8 +688,9 @@ export function CompanionVRM({
       const near = x > -NEAR_PX && y > -NEAR_PX && x < width + NEAR_PX && y < height + NEAR_PX;
       return near && t - cursor.movedAt < 4;
     };
+    const hovering = () => cursor.inside && t - cursor.movedAt < 3;
 
-    // --- load model + clips --------------------------------------------------
+    // --- load model + startup clips ------------------------------------------
     const loader = new GLTFLoader();
     loader.register((parser) => new VRMLoaderPlugin(parser));
 
@@ -486,24 +755,21 @@ export function CompanionVRM({
           if (em?.getExpression(n)) available.add(n);
         }
 
-        const keys = Object.keys(ANIM) as ClipKey[];
-        const clips = await Promise.all(keys.map((k) => tryLoadClip(ANIM[k], loaded, IN_PLACE.has(k))));
+        const startup = CLIP_KEYS.filter((k) => CLIPS[k].startup);
+        startup.forEach((k) => ensureClip(k));
+        await Promise.all(startup.map((k) => loading.get(k)));
         if (disposed || !mixer) return;
-        keys.forEach((k, i) => {
-          const clip = clips[i];
-          if (!clip || !mixer) return;
-          const a = mixer.clipAction(clip);
-          const loop = !ONE_SHOT.has(k);
-          a.setLoop(loop ? THREE.LoopRepeat : THREE.LoopOnce, loop ? Infinity : 1);
-          if (k === "walk") walkRootSpeed = clipRootSpeed(clip);
-          actions[k] = a;
-          loadedClips.add(k);
+        crossfade("idle", 0.01);
+        ready = true;
+        console.info("[pet] ready v", PET_VRM_VERSION, modelUrl, "clips:", [...loadedClips], "expr:", [...available]);
+        if (!greetedThisSession) {
+          greetedThisSession = true;
+          greetAt = t + 1.5;
+          ensureClip("wave");
+        }
+        void prefetch().then(() => {
+          if (!disposed) console.info("[pet] clips loaded:", [...loadedClips], failedClips.size ? `dropped: ${[...failedClips]}` : "");
         });
-
-        if (actions.idle) crossfade("idle", 0.01);
-        else if (actions.look) crossfade("look", 0.01);
-        console.info("[pet] ready v", PET_VRM_VERSION, modelUrl, "clips:", Object.keys(actions), "expr:", [...available]);
-        if (flashRef.current) flashGestureRef.current = true;
       } catch (err) {
         console.error("[pet] load failed", err);
       }
@@ -526,32 +792,37 @@ export function CompanionVRM({
       if (available.has(n)) vrm?.expressionManager?.setValue(n, v);
     };
 
-    // --- behaviour (runs on its own clock, independent of React) ------------
+    // --- strolls ---------------------------------------------------------------
 
     /** Walk clip's sideways foot speed on screen at timeScale 1 (logical px/s). */
     const naturalWalkPx = () => {
       const fovRad = (camera.fov * Math.PI) / 180;
       const dist = camera.position.distanceTo(camTarget);
       const pxPerMetre = (el.clientHeight || 580) / (2 * dist * Math.tan(fovRad / 2));
-      // Mixamo Walking ≈ 1.1 body-heights/s if the clip had no measurable root motion.
-      const mps = walkRootSpeed > 0 ? walkRootSpeed : modelHeight * 1.1;
+      // Fallback: a calm female walk covers ≈ 0.7 body-heights/s.
+      const mps = walkGait > 0 ? walkGait : modelHeight * 0.7;
       return mps * pxPerMetre;
     };
 
     const startIdle = (dwell: number) => {
       activity = "idle";
       actUntil = t + dwell;
-      if (current !== "idle" && current !== "wave") crossfade("idle", 0.6);
+      if (!shot && !transition && posture === "stand" && current !== idleKey()) crossfade(idleKey(), 0.6);
       if (Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 0.6);
     };
 
     const fullIdle = () => {
       strollsInRow = 0;
+      const next = pickIdleBase(loadedClips, effMood() === "happy");
+      if (next !== idleBase) {
+        idleBase = next;
+        if (next === "happyIdle") ensureClip("happyIdle");
+      }
       startIdle(randIn(ROAM_PROFILES[roamAmountRef.current].idleDwell));
     };
 
     const strollInterrupted = () => {
-      const m = moodRef.current;
+      const m = effMood();
       const emotional = m === "happy" || m === "annoyed" || m === "sad" || m === "confused" || m === "error";
       return (
         m === "speaking" ||
@@ -560,15 +831,15 @@ export function CompanionVRM({
         m === "sleeping" ||
         !roamAllowedRef.current ||
         roamAmountRef.current === "off" ||
-        flashGestureRef.current ||
+        pendingCue !== null ||
         reactKeyRef.current !== lastReactKey ||
         (m !== lastMood && emotional)
       );
     };
 
-    const beginStroll = () => {
+    const beginStroll = (opts: { icon?: boolean; forced?: Stroll["forced"]; pounce?: boolean } = {}) => {
       const driver = roamDriverRef.current?.current;
-      if (!driver || !actions.walk) return false;
+      if (!driver || !actions.walk || posture !== "stand") return false;
       const s: Stroll = {
         phase: "measure",
         phaseAt: t,
@@ -584,41 +855,56 @@ export function CompanionVRM({
         interrupted: false,
         dropped: false,
         fadedOut: false,
+        pounce: !!opts.pounce,
+        forced: opts.forced,
       };
       stroll = s;
-      activity = "stroll";
-      void driver.begin().then(
-        (room) => {
-          if (s.dropped || disposed || stroll !== s) {
-            if (room) driver.end();
-            return;
-          }
-          const amount = roamAmountRef.current;
-          const plan = room && !s.interrupted ? planStroll(amount, room) : null;
-          if (!plan) {
-            if (room) driver.end();
-            stroll = null;
-            fullIdle();
-            return;
-          }
-          const prof = ROAM_PROFILES[amount];
-          const gait = solveGait(prof.cruiseSpeed, naturalWalkPx(), prof.targetTimeScale);
-          s.dir = plan.dir;
-          s.motion = makeStrollMotion(plan.distance, prof.cruiseSpeed, prof.rampTime);
-          s.cruise = prof.cruiseSpeed;
-          s.yaw = gait.yaw;
-          s.timeScale = gait.timeScale;
-          s.phase = "turn";
-          s.phaseAt = t;
-          bodyTurn.set(s.dir * s.yaw, t, STROLL_TIMING.turn);
-        },
-        () => {
+      activity = opts.icon ? "visitIcon" : "stroll";
+      void (async () => {
+        let room: Awaited<ReturnType<RoamDriver["begin"]>> = null;
+        try {
+          room = await driver.begin();
+        } catch {
+          room = null;
+        }
+        const release = () => {
+          if (room) driver.end();
+        };
+        if (s.dropped || disposed || stroll !== s) {
+          release();
+          return;
+        }
+        const amount = roamAmountRef.current;
+        let plan: { dir: 1 | -1; distance: number } | null = null;
+        if (room && !s.interrupted) {
+          if (s.forced) plan = s.forced;
+          else if (opts.icon) {
+            const visit = await visitDesktopIcon(room.centerX ?? 0, room, amount);
+            if (visit) {
+              plan = { dir: visit.dir, distance: visit.distance };
+              s.pounce = visit.action === "pounce";
+            }
+          } else plan = planStroll(amount, room);
+        }
+        if (!plan || s.dropped || stroll !== s) {
+          release();
           if (stroll === s) {
             stroll = null;
             fullIdle();
           }
-        },
-      );
+          return;
+        }
+        const prof = ROAM_PROFILES[amount === "off" ? "calm" : amount];
+        const gait = solveGait(prof.cruiseSpeed, naturalWalkPx(), prof.targetTimeScale);
+        s.dir = plan.dir;
+        s.motion = makeStrollMotion(plan.distance, prof.cruiseSpeed, prof.rampTime);
+        s.cruise = prof.cruiseSpeed;
+        s.yaw = gait.yaw;
+        s.timeScale = gait.timeScale;
+        s.phase = "turn";
+        s.phaseAt = t;
+        bodyTurn.set(s.dir * s.yaw, t, STROLL_TIMING.turn);
+      })();
       return true;
     };
 
@@ -632,7 +918,7 @@ export function CompanionVRM({
     const finishStroll = (s: Stroll) => {
       stroll = null;
       strollsInRow += 1;
-      if (!s.interrupted && shouldChainStroll(roamAmountRef.current, strollsInRow)) {
+      if (!s.interrupted && !s.pounce && shouldChainStroll(roamAmountRef.current, strollsInRow)) {
         forceStrollNext = true;
         startIdle(randIn(ROAM_PROFILES[roamAmountRef.current].chainDwell));
       } else {
@@ -640,7 +926,7 @@ export function CompanionVRM({
       }
     };
 
-    /** Advance the stroll choreography: turn → beat → walk → beat → turn back. */
+    /** Advance the stroll choreography: turn → beat → walk → (pounce) → beat → turn back. */
     const advanceStroll = (s: Stroll, dt: number) => {
       const driver = roamDriverRef.current?.current ?? null;
       if (!s.interrupted && strollInterrupted()) {
@@ -696,13 +982,18 @@ export function CompanionVRM({
           setWalkRate(s, s.vel);
           if (!s.fadedOut && m.duration - el2 <= STROLL_TIMING.crossfade) {
             s.fadedOut = true;
-            crossfade("idle", STROLL_TIMING.crossfade);
+            crossfade(idleKey(), STROLL_TIMING.crossfade);
           }
           if (el2 >= m.duration) {
             driver?.end();
-            s.phase = "postPause";
+            const jumpKey: ClipKey | null = actions.joyJump ? "joyJump" : actions.jump ? "jump" : null;
+            if (s.pounce && jumpKey && startShot(jumpKey, { fadeIn: 0.3 })) {
+              s.phase = "pounce";
+            } else {
+              s.phase = "postPause";
+              s.phaseUntil = t + randIn(STROLL_TIMING.postPause);
+            }
             s.phaseAt = t;
-            s.phaseUntil = t + randIn(STROLL_TIMING.postPause);
           }
           return;
         }
@@ -714,7 +1005,7 @@ export function CompanionVRM({
           setWalkRate(s, s.vel);
           if (!s.fadedOut) {
             s.fadedOut = true;
-            crossfade("idle", STROLL_TIMING.abortRamp);
+            crossfade(idleKey(), STROLL_TIMING.abortRamp);
           }
           if (u >= 1) {
             driver?.end();
@@ -724,6 +1015,14 @@ export function CompanionVRM({
           }
           return;
         }
+        case "pounce":
+          if (!shot || t >= shot.end - shot.fadeOut) {
+            endShot(0.5);
+            s.phase = "postPause";
+            s.phaseAt = t;
+            s.phaseUntil = t + randIn(STROLL_TIMING.postPause);
+          }
+          return;
         case "postPause":
           if (t >= s.phaseUntil) {
             s.phase = "turnBack";
@@ -737,17 +1036,34 @@ export function CompanionVRM({
       }
     };
 
+    // --- activities --------------------------------------------------------------
     const startActivity = (next: ActivityId) => {
+      if (VARIATIONS.has(next)) lastVariation = next;
       switch (next) {
         case "stroll":
           if (beginStroll()) return;
           fullIdle();
           return;
+        case "visitIcon":
+          if (beginStroll({ icon: true })) return;
+          fullIdle();
+          return;
         case "lookAround":
           activity = "lookAround";
-          actUntil = t + activityDuration("lookAround");
           glanceSide *= -1;
-          if (actions.look) crossfade("look", 0.6);
+          if (playShot("look", { fadeIn: 0.6, fadeOut: 0.6, interruptible: true })) {
+            actUntil = shot!.end;
+          } else {
+            actUntil = t + activityDuration("lookAround"); // procedural head scan
+          }
+          return;
+        case "stretch":
+          if (!playShot("stretch", { fadeIn: 0.6, fadeOut: 0.7, interruptible: true })) {
+            fullIdle();
+            return;
+          }
+          activity = "stretch";
+          actUntil = shot!.end;
           return;
         case "turn": {
           activity = "turn";
@@ -758,87 +1074,143 @@ export function CompanionVRM({
           bodyTurn.set(glanceSide * rand(0.22, 0.4), t, 0.7);
           return;
         }
-        case "stretch":
-        case "hop": {
-          const key: ClipKey = next === "stretch" ? "stretch" : actions.pounce && Math.random() < 0.5 ? "pounce" : "jump";
-          const act = actions[key];
-          if (!act || !playOnce(key, "idle")) {
+        case "hop":
+          if (!playShot("jump", { fadeIn: 0.35 })) {
             fullIdle();
             return;
           }
-          activity = next;
-          actUntil = t + act.getClip().duration + 0.4;
+          activity = "hop";
+          actUntil = shot!.end;
           return;
-        }
         case "sit":
-          if (!crossfade("sit", 0.8)) {
+          if (!sitDown()) {
             fullIdle();
             return;
           }
           activity = "sit";
-          actUntil = t + activityDuration("sit");
-          return;
-        case "visitIcon":
-          // TODO(visit-icon): run visitDesktopIcon() (behaviour.ts) once icon positions exist.
-          fullIdle();
+          actUntil = t + 2.3 + activityDuration("sit");
           return;
         default:
-          startIdle(randIn(ROAM_PROFILES[roamAmountRef.current].idleDwell));
+          fullIdle();
       }
     };
 
+    // --- behaviour tick (own clock, independent of React) -----------------------
     const updateBehaviour = (dt: number) => {
-      const m = moodRef.current;
+      const m = effMood();
       const engaged = m === "speaking" || m === "listening" || m === "thinking";
       const near = cursorNear();
+      const hover = hovering();
+      if (engaged || hover || near) lastInteractT = t;
 
-      // A stroll always finishes gracefully (eases to a stop, turns back) before
-      // anything else takes over — no snapping mid-step.
+      // Incoming app cues (once per id, even across model swaps).
+      const c = cueRef.current;
+      if (c && c.id > lastHandledCue) {
+        lastHandledCue = c.id;
+        queueCue(c.kind);
+      }
+      if (greetAt > 0 && t >= greetAt) {
+        greetAt = -1;
+        queueCue("wave");
+      }
+      if (pendingCue) {
+        // Time spent finishing a stroll / getting up / a non-yielding shot doesn't count.
+        if (stroll || transition || (shot && !shot.interruptible)) pendingCue.at = Math.max(pendingCue.at, t - CUE_TTL + 3);
+        else if (t - pendingCue.at > CUE_TTL) pendingCue = null;
+      }
+
+      // A stroll always finishes gracefully (eases to a stop, turns back) first.
       if (stroll) {
         advanceStroll(stroll, dt);
         if (stroll) return;
       }
+      // Posture transitions run to completion.
+      if (transition) {
+        if (t < transition.end) return;
+        const tr = transition;
+        transition = null;
+        tr.onDone?.();
+        if (transition) return;
+      }
+      // One-shots: settle back when done; idle variations yield to the user.
+      if (shot) {
+        const yieldNow = shot.interruptible && (engaged || hover || near || pendingCue || m === "sleeping" || reactKeyRef.current !== lastReactKey);
+        if (t >= shot.end - shot.fadeOut || yieldNow) endShot(yieldNow ? 0.5 : shot.fadeOut);
+        else return;
+      }
       if (activity === "turn" && t >= turnBackAt && Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 0.7);
 
-      if (flashGestureRef.current) {
-        flashGestureRef.current = false;
-        enterMode("react", 3.5);
-        reactFrom = t;
-        if (!playOnce("wave", "idle")) {
-          if (!crossfade("talk")) crossfade("idle");
-        }
-        return;
-      }
-
-      // Reactions: explicit poke, or an emotional mood change.
-      const moodChanged = m !== lastMood;
-      const emotional = m === "happy" || m === "annoyed" || m === "sad" || m === "confused" || m === "error";
-      if (reactKeyRef.current !== lastReactKey || (moodChanged && emotional && mode !== "sleep")) {
-        lastReactKey = reactKeyRef.current;
-        lastMood = m;
-        enterMode("react", 1.8);
-        reactFrom = t;
-        if (Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 0.5);
-        if (m === "happy" || !moodChanged) playOnce("wave", "idle");
-        return;
-      }
-      lastMood = m;
-
+      // Sleep (app inactivity timer) → lie down (sitting first), wake → get up + small stretch.
       if (m === "sleeping" && !engaged) {
         if (mode !== "sleep") {
           enterMode("sleep", 1e9);
-          if (Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 1.2);
-          if (!crossfade("sleep", 1.2)) if (!crossfade("sit", 1.2)) crossfade("idle", 1.2);
+          pendingCue = null;
+          if (Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 1.0);
+          lieDown();
+          if (!transition && posture === "stand") crossfade(idleKey(), 1.2);
         }
         return;
       }
       if (mode === "sleep") {
-        // Woke up: a little nod, then attentive.
-        enterMode("react", 1.6);
+        enterMode("react", 0.5);
         reactFrom = t;
-        crossfade("idle", 0.8);
+        lastMood = m;
+        activity = "idle";
+        actUntil = t + rand(6, 10);
+        getUp(() => {
+          const busy = effMood() === "speaking" || effMood() === "listening" || effMood() === "thinking";
+          // A queued greeting (user came back) follows a shorter stretch.
+          if (!busy) startShot("stretch", { fadeIn: 0.6, fadeOut: 0.8, maxDur: pendingCue ? 2.6 : 3.8, timeScale: 1.1, interruptible: !pendingCue });
+        });
         return;
       }
+
+      // Seated: hovering / clicking / talking / a gesture → stand up smoothly first.
+      const poked = reactKeyRef.current !== lastReactKey;
+      const emotional = m === "happy" || m === "annoyed" || m === "sad" || m === "confused" || m === "error";
+      const moodChanged = m !== lastMood;
+      if (posture === "sit" && (engaged || hover || poked || pendingCue || (moodChanged && emotional))) {
+        activity = "idle";
+        actUntil = t + rand(6, 10);
+        standUp();
+        return;
+      }
+      if (posture === "lie") {
+        getUp();
+        return;
+      }
+
+      // Gesture cue (wave / kiss / jumps).
+      if (pendingCue) {
+        const k = gestureClip(pendingCue.kind);
+        if (actions[k]) {
+          if (Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 0.4);
+          if (startShot(k, { fadeIn: 0.4, fadeOut: 0.5 })) {
+            if (pendingCue.kind === "wave") lastWaveAt = t;
+            lastInteractT = t;
+            pendingCue = null;
+            return;
+          }
+        } else if (failedClips.has(k)) {
+          // Fallbacks: a missing jump becomes a kiss/wave if those exist.
+          const alt: GestureKind | null = k === "joyJump" ? "kiss" : k === "kiss" ? "wave" : null;
+          pendingCue = alt ? { kind: alt, at: pendingCue.at } : null;
+        }
+        // else: still loading → wait (TTL above).
+      }
+
+      // Reactions: explicit poke (wave hello, else a nod), or an emotional mood change.
+      if (poked || (moodChanged && emotional)) {
+        lastReactKey = reactKeyRef.current;
+        lastMood = m;
+        lastInteractT = t;
+        enterMode("react", 1.8);
+        reactFrom = t;
+        if (Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 0.5);
+        if (poked && t - lastWaveAt > WAVE_COOLDOWN) queueCue("wave");
+        return;
+      }
+      lastMood = m;
 
       if (mode === "react" && t < modeUntil) return;
 
@@ -848,24 +1220,30 @@ export function CompanionVRM({
           if (Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 0.5);
         }
         modeUntil = t + 2;
-        const want: ClipKey = m === "speaking" && actions.talk ? "talk" : m === "thinking" && actions.think ? "think" : "idle";
-        if (current !== want && current !== "wave") crossfade(want, 0.5);
+        if (m === "thinking") ensureClip("think");
+        const want = baseClip();
+        if (current !== want) crossfade(want, 0.5);
         return;
       }
 
       if (mode !== "activity") {
-        // Back to her own business: settle for a while first.
+        // Back to her own business: settle for a while first (a seated break carries on).
         mode = "activity";
-        startIdle(rand(4, 9));
+        if (posture === "sit") actUntil = Math.max(actUntil, t + rand(4, 9));
+        else startIdle(rand(4, 9));
+        if (current !== baseClip()) settleBase(0.6);
         return;
       }
 
       if (t < actUntil) return;
 
       // Activity finished → tidy up, then pick the next one.
-      if (activity === "sit" || activity === "lookAround") crossfade("idle", 0.8);
+      if (posture === "sit") {
+        standUp(() => fullIdle());
+        return;
+      }
       if (activity !== "idle") {
-        startIdle(randIn(ROAM_PROFILES[roamAmountRef.current].idleDwell));
+        fullIdle();
         return;
       }
       const amount = roamAmountRef.current;
@@ -878,26 +1256,55 @@ export function CompanionVRM({
         }
         strollsInRow = 0;
       }
-      startActivity(pickActivity({ amount, clips: loadedClips, canMove, strollsInRow }));
+      startActivity(
+        pickActivity({
+          amount,
+          clips: loadedClips,
+          canMove,
+          strollsInRow,
+          lastVariation,
+          idleFor: t - lastInteractT,
+          playful: playfulRef.current,
+        }),
+      );
+    };
+
+    const updateTalkLayer = (dt: number) => {
+      const speaking = effMood() === "speaking";
+      if (speaking) ensureClip("talk");
+      const a = actions.talk;
+      if (!a) return;
+      const want = speaking && posture === "stand" && !transition && !stroll && !shot ? 1 : 0;
+      talkW = damp(talkW, want, want ? 2.5 : 3.5, dt);
+      if (talkW > 0.01) {
+        if (!a.isRunning()) a.reset().play();
+        a.setEffectiveWeight(talkW * TALK_LAYER_WEIGHT);
+      } else if (a.isRunning()) {
+        a.stop();
+        talkW = 0;
+      }
     };
 
     const applyProcedural = (dt: number) => {
       if (!vrm) return;
-      const m = moodRef.current;
+      const m = effMood();
       const engaged = m === "speaking" || m === "listening" || m === "thinking";
       const sleeping = mode === "sleep";
       const walking = !!stroll && stroll.phase !== "measure";
+      const lie = lieTween.update(t);
       sleepBlend = damp(sleepBlend, sleeping ? 1 : 0, 1.5, dt);
+      // Head droop only when there's no lying clip carrying the sleep pose.
+      const droop = sleepBlend * (1 - lie);
 
       // Target look (yaw/pitch, radians) from cursor relative to her head.
       let tYaw = 0;
       let tPitch = 0;
       const headX = cursor.width * 0.5;
-      const headY = cursor.height * 0.22;
+      const headY = cursor.height * (posture === "sit" ? 0.4 : 0.22);
       const dx = cursor.x - headX;
       const dy = cursor.y - headY;
       const own = mode === "activity";
-      const follow = mode === "attend" ? 1 : walking || sleeping ? 0 : 0.45;
+      const follow = (mode === "attend" ? 1 : walking || sleeping || transition ? 0 : 0.45) * (1 - lie);
       if (follow > 0 && t - cursor.movedAt < 8) {
         tYaw = clamp(Math.atan2(dx, 700), -0.75, 0.75) * follow;
         tPitch = clamp(Math.atan2(dy, 900), -0.35, 0.45) * follow;
@@ -906,23 +1313,23 @@ export function CompanionVRM({
         // Glance where she's heading (the body is only turned ~3/4).
         tYaw += stroll.dir * 0.22;
         tPitch += 0.04;
-      } else if (own && activity === "lookAround" && !actions.look) {
+      } else if (own && activity === "lookAround" && !shot) {
         // Procedural look-around when the clip is missing (slow, unhurried).
         tYaw += Math.sin((t - actUntil) * 0.9) * 0.4 * glanceSide;
         tPitch += Math.sin(t * 0.31) * 0.05;
-      } else if (own && follow < 1) {
+      } else if (own && follow < 1 && !shot && posture === "stand") {
         tYaw += Math.sin(t * 0.22) * 0.1 * glanceSide;
       }
-      if (m === "thinking") {
+      if (m === "thinking" && !actions.think) {
         tYaw += -0.25;
         tPitch += -0.15;
       }
 
-      // React: quick nod + tilt when there's no Waving clip carrying it.
+      // React: quick nod + tilt (procedural; gestures are clips).
       let nod = 0;
       let tilt = 0;
       const rt = t - reactFrom;
-      if (mode === "react" && rt < 1.8) {
+      if (mode === "react" && rt < 1.8 && !shot) {
         const env = Math.sin(Math.min(1, rt / 1.8) * Math.PI);
         nod = Math.sin(rt * 9) * 0.08 * env;
         tilt = 0.12 * env * (m === "confused" ? 1.6 : 1);
@@ -933,30 +1340,38 @@ export function CompanionVRM({
       lookYaw = damp(lookYaw, tYaw, 3.5, dt);
       lookPitch = damp(lookPitch, tPitch, 3.5, dt);
 
-      // Sleep pose: head down, slow breath.
-      const sleepPitch = 0.38 * sleepBlend;
+      const sleepPitch = 0.38 * droop;
       const breathRate = sleeping ? 0.9 : engaged ? 1.9 : 1.5;
       const breath = Math.sin(t * breathRate * Math.PI * 0.5);
 
       addRot("neck", lookPitch * 0.4 + sleepPitch * 0.5, lookYaw * 0.4, tilt * 0.4);
       addRot("head", lookPitch * 0.6 + nod + sleepPitch * 0.5, lookYaw * 0.6, tilt * 0.6);
-      addRot("upperChest", breath * 0.012, lookYaw * 0.12, 0);
-      addRot("chest", breath * 0.01 + sleepBlend * 0.08, 0, 0);
-      // Weight shift.
-      addRot("spine", 0, 0, Math.sin(t * 0.45) * 0.02 * (1 - sleepBlend));
+      addRot("upperChest", breath * 0.008, lookYaw * 0.12, 0);
+      addRot("chest", breath * 0.006 + droop * 0.08, 0, 0);
 
       // No idle clip at all → don't T-pose: arms down, relaxed elbows.
-      if (!actions.idle && !actions.look && current !== "walk") {
+      if (!actions.idle && current !== "walk") {
         addRot("leftUpperArm", 0, 0, -1.2 + breath * 0.01);
         addRot("rightUpperArm", 0, 0, 1.2 - breath * 0.01);
         addRot("leftLowerArm", 0, -0.15, 0);
         addRot("rightLowerArm", 0, 0.15, 0);
       }
 
-      // Body turn: eased deliberate turns (stroll heading / turn-in-place) plus
-      // a slow drift toward the cursor when standing.
-      driftYaw = damp(driftYaw, stroll || sleeping ? 0 : lookYaw * 0.2 + Math.sin(t * 0.18) * 0.04, 2, dt);
-      root.rotation.set(0, bodyTurn.update(t) + driftYaw, 0);
+      // Body turn: eased deliberate turns (stroll heading / turn-in-place) plus a
+      // slow drift toward the cursor when standing; lying turns her side-on.
+      const standing = posture === "stand" && !transition && !sleeping;
+      driftYaw = damp(driftYaw, stroll || !standing ? 0 : lookYaw * 0.2 + Math.sin(t * 0.18) * 0.04, 2, dt);
+      const lieYaw = lie * lieSide * (Math.PI / 2);
+      root.rotation.set(0, bodyTurn.update(t) + driftYaw + lieYaw, 0);
+      if (lie !== lastLie) {
+        lastLie = lie;
+        root.position.set(-lieCenterZ * Math.sin(lieYaw), lieDrop * lie, 0);
+        const h = modelHeight;
+        const zoom = 1 + LIE_ZOOM * lie;
+        camera.position.set(0, h * (0.58 - 0.18 * lie), h * 2.05 * zoom);
+        camTarget.set(0, h * (0.48 - 0.24 * lie), 0);
+        camera.lookAt(camTarget);
+      }
 
       // Eyes.
       const headNode = bone("head");
@@ -971,8 +1386,9 @@ export function CompanionVRM({
 
     const applyExpressions = (dt: number) => {
       if (!vrm?.expressionManager) return;
-      const m = moodRef.current;
+      const m = effMood();
       const target = moodExpressions(mode === "sleep" ? "sleeping" : m, flashRef.current);
+      if (shot?.key === "kiss" || shot?.key === "joyJump") target.happy = Math.max(target.happy ?? 0, 0.5);
       for (const [n, v] of Object.entries(target)) {
         expr[n] = damp(expr[n] ?? 0, v, 4, dt);
         setExpr(n, expr[n]);
@@ -996,16 +1412,11 @@ export function CompanionVRM({
     const clock = new THREE.Clock();
     const frameInterval = 1 / TARGET_FPS;
     let acc = 0;
-    const tick = () => {
-      frame = requestAnimationFrame(tick);
-      acc += clock.getDelta();
-      if (acc < frameInterval - 0.002) return;
-      const dt = Math.min(acc, 0.1);
-      acc = 0;
+    const step = (dt: number) => {
       t += dt;
-
-      if (vrm && mixer) {
+      if (vrm && mixer && ready) {
         updateBehaviour(dt);
+        updateTalkLayer(dt);
         // Reset procedural bones to rest so clip tracks (or nothing) define the base pose.
         for (const n of PROC_BONES) bone(n)?.quaternion.identity();
         mixer.update(dt);
@@ -1013,6 +1424,14 @@ export function CompanionVRM({
         applyExpressions(dt);
         vrm.update(dt);
       }
+    };
+    const tick = () => {
+      frame = requestAnimationFrame(tick);
+      acc += clock.getDelta();
+      if (acc < frameInterval - 0.002) return;
+      const dt = Math.min(acc, 0.1);
+      acc = 0;
+      step(dt);
       renderer.render(scene, camera);
     };
 
@@ -1049,6 +1468,81 @@ export function CompanionVRM({
     };
     void checkWindow();
 
+    // DEV-only hooks for the headless clip/state check (tree-shaken from release builds).
+    if (import.meta.env.DEV) {
+      const fakeDriver: RoamDriver = {
+        begin: async () => ({ left: 600, right: 600, centerX: 800 }),
+        moveTo: () => undefined,
+        end: () => undefined,
+      };
+      const dbg = {
+        state: () => ({
+          ready,
+          t: +t.toFixed(2),
+          mode,
+          posture,
+          activity,
+          current,
+          shot: shot?.key ?? null,
+          transition: transition?.kind ?? null,
+          stroll: stroll?.phase ?? null,
+          talkW: +talkW.toFixed(2),
+          lie: +lieTween.value.toFixed(2),
+          loaded: [...loadedClips],
+          failed: [...failedClips],
+          walkGait: +walkGait.toFixed(3),
+          gait: solveGait(ROAM_PROFILES.calm.cruiseSpeed, naturalWalkPx(), ROAM_PROFILES.calm.targetTimeScale),
+          naturalWalkPx: +naturalWalkPx().toFixed(1),
+        }),
+        /** Live pose sanity: NaN / explosion / T-pose, root-local, relative to model height. */
+        pose: () => {
+          if (!vrm) return null;
+          const hp = new THREE.Vector3();
+          vrm.humanoid.getRawBoneNode("hips")!.getWorldPosition(hp);
+          let maxDist = 0;
+          let nan = false;
+          const v = new THREE.Vector3();
+          for (const n of PROBE_BONES) {
+            const node = vrm.humanoid.getRawBoneNode(n);
+            if (!node) continue;
+            node.getWorldPosition(v);
+            if (!Number.isFinite(v.x + v.y + v.z)) nan = true;
+            maxDist = Math.max(maxDist, v.distanceTo(hp));
+          }
+          return { nan, maxDist: +(maxDist / modelHeight).toFixed(2), hipsY: +(hp.y / modelHeight).toFixed(2) };
+        },
+        mood: (mm: PetMood | null) => (debugMood = mm),
+        roam: (a: RoamAmount | null) => {
+          debugRoam = a;
+          roamAmountRef.current = a ?? roamAmount;
+          roamAllowedRef.current = a !== null || roamAllowed;
+        },
+        cue: (k: GestureKind) => queueCue(k),
+        activity: (a: ActivityId) => {
+          if (a === "stroll" || a === "visitIcon") roamDriverRef.current = { current: fakeDriver };
+          startActivity(a);
+        },
+        pounce: (distance = 160) => {
+          roamDriverRef.current = { current: fakeDriver };
+          return beginStroll({ forced: { dir: 1, distance }, pounce: true });
+        },
+        load: async () => {
+          for (const k of CLIP_KEYS) ensureClip(k);
+          await Promise.all([...loading.values()]);
+          return { loaded: [...loadedClips], failed: [...failedClips] };
+        },
+        /** Fast-forward the simulation (no rendering) by `sec` seconds. */
+        advance: (sec: number) => {
+          const n = Math.ceil(sec * TARGET_FPS);
+          for (let i = 0; i < n; i++) step(1 / TARGET_FPS);
+          renderer.render(scene, camera);
+        },
+        pauseLoop: () => stop(),
+        canvas: () => renderer.domElement,
+      };
+      (window as unknown as { __petDebug?: typeof dbg }).__petDebug = dbg;
+    }
+
     return () => {
       disposed = true;
       cancelAnimationFrame(frame);
@@ -1062,7 +1556,11 @@ export function CompanionVRM({
         if (stroll.phase !== "measure") roamDriverRef.current?.current?.end();
         stroll = null;
       }
-      mixer?.stopAllAction();
+      if (mixer) {
+        mixer.stopAllAction();
+        for (const a of Object.values(actions)) if (a) mixer.uncacheClip(a.getClip());
+        if (vrm) mixer.uncacheRoot(vrm.scene);
+      }
       vrmRef.current = null;
       if (vrm) {
         root.remove(vrm.scene);
