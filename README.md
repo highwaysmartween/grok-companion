@@ -12,6 +12,15 @@ Package: `grok-desktop-companion` · Identifier: `com.grok.desktopcompanion`
 - Settings for model, system prompt, **personality**, companion name, always-on-top, and **voice** prefs
 - Optional local memory commands (remember / list / forget)
 
+## v1.1.1 — "companion life"
+
+- Desktop pet shell: always on top, no taskbar button, **tray icon** (Show/Hide, Pause roaming, Settings, Quit), **launches with Windows** (toggle in Settings; release builds only).
+- She walks along the bottom of the work area (on the taskbar), faces where she walks, stops when you hover, looks at your cursor, breathes, reacts, and falls asleep after ~2 min of inactivity.
+- Voice: async TTS/STT (no UI freezes), real stop/barge-in, utterance queue, tighter "hey" / "hey &lt;name&gt;" wake word with back-off, offline fallback when WebView speech fails.
+- Brain: Grok CLI gets the persona via `--system-prompt-override` and the chat via `--prompt-file` (auto-falls back to the old `-p` flags if your CLI rejects them); history trimmed to the last 20 messages.
+- Lightweight rendering: 30 fps cap, pixel ratio ≤ 1.25, low-power GPU, paused when hidden/minimized.
+- Optional clips: drop `Happy_Idle`, `Looking_Around`, `Waving`, `Talking_2`, `Thinking`, `Sitting`, `Sleeping` (Mixamo FBX) into `public/animations/` and they're used automatically; otherwise procedural motion fills in.
+
 ## Run from source
 
 Prerequisites: Node.js 20+, Rust (stable), WebView2, MSVC C++ Build Tools. See [Tauri prerequisites](https://tauri.app/start/prerequisites/).

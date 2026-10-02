@@ -1,232 +1,238 @@
-//! Natural TTS via Microsoft Edge neural voices (edge-tts). Falls back with a clear error.
+//! Natural TTS via Microsoft Edge neural voices (edge-tts), played with a
+//! hidden PowerShell MediaPlayer. Falls back with a clear error so the frontend
+//! can use Web Speech instead.
 //!
 //! Windows install if missing:
 //!   py -3 -m pip install --user edge-tts
-//!   (or) pip install --user edge-tts
-//! Then ensure `%APPDATA%\Python\Python3*\Scripts` or user Scripts is on PATH,
-//! or we will try `py -3 -m edge_tts` / `python -m edge_tts` automatically.
-//! Frontend falls back to Web Speech if this command errors.
+//!
+//! Commands are async (run on a blocking worker, never the main thread) and
+//! every child (synth + playback) registers its PID so `tts_stop` can kill it
+//! immediately for barge-in.
 
+use crate::proc;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::State;
 
 pub struct TtsState {
-    pub cancel: AtomicBool,
+    /// Bumped by every speak + stop; a speak whose generation is stale exits quietly.
     pub gen: AtomicU64,
-    pub play_pid: Mutex<Option<u32>>,
+    pub synth_pid: AtomicU32,
+    pub play_pid: AtomicU32,
+    /// Cached working edge-tts launcher (program + prefix args) so we don't
+    /// probe five candidates on every utterance.
+    launcher: Mutex<Option<Vec<String>>>,
 }
 
 impl Default for TtsState {
     fn default() -> Self {
         Self {
-            cancel: AtomicBool::new(false),
             gen: AtomicU64::new(0),
-            play_pid: Mutex::new(None),
+            synth_pid: AtomicU32::new(0),
+            play_pid: AtomicU32::new(0),
+            launcher: Mutex::new(None),
         }
     }
 }
 
-fn try_edge_tts(voice: &str, text: &str, out: &str) -> bool {
-    // 1) edge-tts on PATH
-    if let Ok(s) = Command::new("edge-tts")
-        .args(["--voice", voice, "--text", text, "--write-media", out])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        if s.success() && PathBuf::from(out).exists() {
-            return true;
-        }
+impl TtsState {
+    fn is_current(&self, gen: u64) -> bool {
+        self.gen.load(Ordering::SeqCst) == gen
     }
+}
 
-    // 2) Common Windows user-local Scripts shims
-    let mut candidates: Vec<PathBuf> = Vec::new();
+fn launcher_candidates() -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = vec![vec!["edge-tts".into()]];
+    let mut scripts: Vec<PathBuf> = Vec::new();
     if let Ok(appdata) = std::env::var("APPDATA") {
         if let Ok(rd) = std::fs::read_dir(PathBuf::from(appdata).join("Python")) {
             for ent in rd.flatten() {
-                candidates.push(ent.path().join("Scripts").join("edge-tts.exe"));
-                candidates.push(ent.path().join("Scripts").join("edge-tts"));
+                scripts.push(ent.path().join("Scripts").join("edge-tts.exe"));
             }
         }
     }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        candidates.push(
-            PathBuf::from(local)
-                .join("Programs")
-                .join("Python")
-                .join("Scripts")
-                .join("edge-tts.exe"),
-        );
-    }
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        candidates.push(
-            PathBuf::from(profile)
-                .join("AppData")
-                .join("Roaming")
-                .join("Python"),
-        );
-    }
-    for c in &candidates {
-        if !c.exists() {
-            continue;
-        }
-        if let Ok(s) = Command::new(c)
-            .args(["--voice", voice, "--text", text, "--write-media", out])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            if s.success() && PathBuf::from(out).exists() {
-                return true;
+        let base = PathBuf::from(local).join("Programs").join("Python");
+        if let Ok(rd) = std::fs::read_dir(&base) {
+            for ent in rd.flatten() {
+                scripts.push(ent.path().join("Scripts").join("edge-tts.exe"));
             }
         }
     }
-
-    // 3) python -m edge_tts / py -3 -m edge_tts
-    for (bin, prefix) in [
-        ("py", vec!["-3", "-m", "edge_tts"]),
-        ("python", vec!["-m", "edge_tts"]),
-        ("python3", vec!["-m", "edge_tts"]),
-    ] {
-        let mut args: Vec<&str> = prefix;
-        args.extend(["--voice", voice, "--text", text, "--write-media", out]);
-        if let Ok(s) = Command::new(bin)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            if s.success() && PathBuf::from(out).exists() {
-                return true;
-            }
-        }
+    for p in scripts.into_iter().filter(|p| p.is_file()) {
+        out.push(vec![p.to_string_lossy().to_string()]);
     }
-    false
+    out.push(vec!["py".into(), "-3".into(), "-m".into(), "edge_tts".into()]);
+    out.push(vec!["python".into(), "-m".into(), "edge_tts".into()]);
+    out.push(vec!["python3".into(), "-m".into(), "edge_tts".into()]);
+    out
 }
 
-#[tauri::command]
-pub fn tts_speak_natural(
-    text: String,
-    voice: Option<String>,
-    state: State<'_, TtsState>,
-) -> Result<(), String> {
-    let trimmed = text.trim().to_string();
-    if trimmed.is_empty() {
-        return Ok(());
-    }
-    let trimmed = if trimmed.chars().count() > 800 {
-        trimmed.chars().take(800).collect::<String>() + "…"
-    } else {
-        trimmed
+enum Synth {
+    Ok,
+    Cancelled,
+    Failed(String),
+}
+
+fn synth_with(state: &TtsState, gen: u64, launcher: &[String], voice: &str, text: &str, out: &str) -> Synth {
+    let Some((prog, prefix)) = launcher.split_first() else {
+        return Synth::Failed("empty launcher".into());
     };
-
-    // Default: en-HK-YanNeural (East Asian teen/young woman speaking English).
-    let voice = voice
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "en-HK-YanNeural".to_string());
-
-    let gen = state.gen.fetch_add(1, Ordering::SeqCst) + 1;
-    state.cancel.store(false, Ordering::SeqCst);
-
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let out: PathBuf = std::env::temp_dir().join(format!("grok-companion-tts-{stamp}.mp3"));
-    let out_str = out.to_str().ok_or("bad temp path")?.to_string();
-
-    let ok = try_edge_tts(&voice, &trimmed, &out_str);
-
-    if !ok {
-        let _ = std::fs::remove_file(&out);
-        return Err(
-            "Could not synthesize natural voice. Install: py -3 -m pip install --user edge-tts (needs network). App will fall back to Web Speech."
-                .into(),
-        );
+    let mut cmd = proc::command(prog);
+    cmd.args(prefix)
+        .arg("--voice")
+        .arg(voice)
+        // `--text=` form so text starting with '-' isn't parsed as a flag.
+        .arg(format!("--text={text}"))
+        .arg("--write-media")
+        .arg(out);
+    let res = proc::run_tracked_checked(cmd, &state.synth_pid, &|| state.is_current(gen));
+    if !state.is_current(gen) {
+        return Synth::Cancelled;
     }
-
-    if state.cancel.load(Ordering::SeqCst) || state.gen.load(Ordering::SeqCst) != gen {
-        let _ = std::fs::remove_file(&out);
-        return Ok(());
+    match res {
+        Ok(o) if o.status.success()
+            && std::fs::metadata(out).map(|m| m.len() > 0).unwrap_or(false) =>
+        {
+            Synth::Ok
+        }
+        Ok(o) => Synth::Failed(String::from_utf8_lossy(&o.stderr).trim().chars().take(200).collect()),
+        Err(e) => Synth::Failed(e),
     }
+}
 
-    let path = out
-        .canonicalize()
-        .unwrap_or(out.clone())
-        .to_string_lossy()
-        .replace('\'', "''");
+fn synthesize(state: &TtsState, gen: u64, voice: &str, text: &str, out: &str) -> Synth {
+    let cached = state.launcher.lock().ok().and_then(|g| g.clone());
+    if let Some(l) = cached {
+        // Launcher known-good: a failure now is most likely network — don't
+        // burn seconds probing other launchers before the Web Speech fallback.
+        return synth_with(state, gen, &l, voice, text, out);
+    }
+    let mut last = String::from("edge-tts not found");
+    for cand in launcher_candidates() {
+        match synth_with(state, gen, &cand, voice, text, out) {
+            Synth::Ok => {
+                if let Ok(mut g) = state.launcher.lock() {
+                    *g = Some(cand);
+                }
+                return Synth::Ok;
+            }
+            Synth::Cancelled => return Synth::Cancelled,
+            Synth::Failed(e) => last = e,
+        }
+    }
+    Synth::Failed(last)
+}
 
-    let ps = format!(
+fn play_script(path: &str) -> String {
+    let path = path.replace('\'', "''");
+    format!(
         r#"
 Add-Type -AssemblyName presentationCore
 $p = New-Object System.Windows.Media.MediaPlayer
 $p.Open([Uri]'{path}')
 $sw = [Diagnostics.Stopwatch]::StartNew()
 while (-not $p.NaturalDuration.HasTimeSpan) {{
-  Start-Sleep -Milliseconds 50
-  if ($sw.ElapsedMilliseconds -gt 8000) {{ break }}
+  Start-Sleep -Milliseconds 30
+  if ($sw.ElapsedMilliseconds -gt 6000) {{ break }}
 }}
 $p.Volume = 1
 $p.Play()
 $dur = if ($p.NaturalDuration.HasTimeSpan) {{ $p.NaturalDuration.TimeSpan.TotalMilliseconds }} else {{ 15000 }}
 $sw.Restart()
-while ($sw.ElapsedMilliseconds -lt ($dur + 200)) {{
-  Start-Sleep -Milliseconds 120
+while ($sw.ElapsedMilliseconds -lt ($dur + 150)) {{
+  Start-Sleep -Milliseconds 60
 }}
 $p.Stop()
 $p.Close()
 "#
-    );
+    )
+}
 
-    let mut child = Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Could not play voice: {e}"))?;
+/// "done" when playback finished, "stopped" when cancelled by tts_stop or a newer utterance.
+fn speak_blocking(state: &TtsState, text: String, voice: Option<String>) -> Result<String, String> {
+    if !cfg!(windows) {
+        return Err("Natural voice playback is only implemented on Windows; using Web Speech.".into());
+    }
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok("done".into());
+    }
+    let trimmed = if trimmed.chars().count() > 800 {
+        trimmed.chars().take(800).collect::<String>() + "…"
+    } else {
+        trimmed
+    };
+    // Default: en-HK-YanNeural (East Asian young woman speaking English).
+    let voice = voice
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| crate::settings::DEFAULT_VOICE.to_string());
 
-    if let Ok(mut slot) = state.play_pid.lock() {
-        *slot = Some(child.id());
+    let gen = state.gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let out = proc::TempFile(proc::temp_file("tts", "mp3"));
+    let out_str = out.0.to_string_lossy().to_string();
+
+    match synthesize(state, gen, &voice, &trimmed, &out_str) {
+        Synth::Ok => {}
+        Synth::Cancelled => return Ok("stopped".into()),
+        Synth::Failed(detail) => {
+            return Err(format!(
+                "Could not synthesize natural voice ({detail}). Install: py -3 -m pip install --user edge-tts (needs network). Falling back to Web Speech."
+            ))
+        }
+    }
+    if !state.is_current(gen) {
+        return Ok("stopped".into());
     }
 
-    let status = child.wait().map_err(|e| format!("Playback failed: {e}"))?;
-    if let Ok(mut slot) = state.play_pid.lock() {
-        *slot = None;
+    let path = out.0.canonicalize().unwrap_or(out.0.clone());
+    let mut cmd = proc::command("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &play_script(&path.to_string_lossy()),
+    ]);
+    let res = proc::run_tracked_checked(cmd, &state.play_pid, &|| state.is_current(gen));
+    if !state.is_current(gen) {
+        return Ok("stopped".into());
     }
-    let _ = std::fs::remove_file(&out);
-
-    if !status.success() && state.gen.load(Ordering::SeqCst) == gen {
-        return Err("Playback ended unexpectedly.".into());
+    match res {
+        Ok(o) if o.status.success() => Ok("done".into()),
+        Ok(_) => Err("Playback ended unexpectedly.".into()),
+        Err(e) => Err(format!("Could not play voice: {e}")),
     }
-    Ok(())
 }
 
 #[tauri::command]
-pub fn tts_stop(state: State<'_, TtsState>) -> Result<(), String> {
-    state.cancel.store(true, Ordering::SeqCst);
-    state.gen.fetch_add(1, Ordering::SeqCst);
-    if let Ok(mut slot) = state.play_pid.lock() {
-        if let Some(pid) = slot.take() {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-    }
-    Ok(())
+pub async fn tts_speak_natural(
+    text: String,
+    voice: Option<String>,
+    state: State<'_, Arc<TtsState>>,
+) -> Result<String, String> {
+    let st = Arc::clone(&*state);
+    tauri::async_runtime::spawn_blocking(move || speak_blocking(&st, text, voice))
+        .await
+        .map_err(|e| format!("TTS task failed: {e}"))?
+}
+
+/// Stop synth + playback right now (barge-in). Safe to call when idle.
+#[tauri::command]
+pub async fn tts_stop(state: State<'_, Arc<TtsState>>) -> Result<(), String> {
+    let st = Arc::clone(&*state);
+    st.gen.fetch_add(1, Ordering::SeqCst);
+    tauri::async_runtime::spawn_blocking(move || {
+        proc::kill_slot(&st.synth_pid);
+        proc::kill_slot(&st.play_pid);
+    })
+    .await
+    .map_err(|e| format!("TTS stop failed: {e}"))
 }
 
 #[tauri::command]
 pub fn tts_default_voice() -> String {
-    "en-HK-YanNeural".into()
+    crate::settings::DEFAULT_VOICE.into()
 }

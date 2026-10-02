@@ -1,10 +1,19 @@
 import { useEffect, useRef } from "react";
+import type { MutableRefObject } from "react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { VRMLoaderPlugin, VRMUtils } from "@pixiv/three-vrm";
-import type { VRM } from "@pixiv/three-vrm";
+import type { VRM, VRMHumanBoneName } from "@pixiv/three-vrm";
+import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { PetMood } from "../../types";
 import { loadMixamoAnimation } from "./loadMixamoAnimation";
+
+/** Host ↔ pet walk contract: host writes the real direction (±1) once it knows
+ *  the window can move, or 0 to end/abort the walk. `null` = pending. */
+export interface RoamControl {
+  facing: 1 | -1 | 0 | null;
+}
 
 interface Props {
   mood: PetMood;
@@ -12,38 +21,74 @@ interface Props {
   modelUrl?: string;
   /** When true, hide CLOTH materials so the nude/lingerie body shows. */
   flash?: boolean;
+  /** Allow the wander behaviour (walk + window move). */
+  roamEnabled?: boolean;
+  /** Bump to trigger a one-shot reaction (wave / nod). */
+  reactKey?: number;
   /**
    * Fired when a roam walk segment starts/ends so the host can move the
-   * transparent Tauri window across the desktop (CompanionVRM itself only
-   * plays the walk clip + facing).
+   * transparent Tauri window across the desktop.
    */
   onWalkStart?: (opts: { facing: 1 | -1; durationMs: number }) => void;
   onWalkEnd?: () => void;
+  roamControl?: MutableRefObject<RoamControl>;
 }
 
+/**
+ * Clips. Only Idle.fbx + Walking.fbx ship today; everything else is optional and
+ * picked up automatically if dropped into public/animations/ later. Missing clips
+ * fall back to procedural motion (look-at, breathing, nods, sleep pose).
+ */
 const ANIM = {
-  idle: "/animations/Happy_Idle.fbx",
-  idleFallback: "/animations/Idle.fbx",
-  look: "/animations/Looking_Around.fbx",
-  walk: "/animations/Walking.fbx",
-  wave: "/animations/Waving.fbx",
-  talk: "/animations/Talking_2.fbx",
-  think: "/animations/Thinking.fbx",
+  idle: ["/animations/Happy_Idle.fbx", "/animations/Idle.fbx"],
+  look: ["/animations/Looking_Around.fbx"],
+  walk: ["/animations/Walking.fbx"],
+  wave: ["/animations/Waving.fbx"],
+  talk: ["/animations/Talking_2.fbx"],
+  think: ["/animations/Thinking.fbx"],
+  sit: ["/animations/Sitting.fbx"],
+  sleep: ["/animations/Sleeping.fbx"],
 } as const;
 
-export const PET_VRM_VERSION = 16;
+export const PET_VRM_VERSION = 17;
 
-type ClipKey = "idle" | "look" | "walk" | "wave" | "talk" | "think";
+type ClipKey = keyof typeof ANIM;
+type Behaviour = "idle" | "wander" | "look" | "react" | "sleep";
+
+/** Lightweight rendering for Iris Xe-class GPUs. */
+const TARGET_FPS = 30;
+const MAX_PIXEL_RATIO = 1.25;
+const CURSOR_POLL_MS = 100;
+const CURSOR_POLL_SLEEP_MS = 500;
+/** Cursor counts as "near" within this many px of the window edge. */
+const NEAR_PX = 140;
 
 const CLOTH_RE =
   /CLOTH|SHOES|SOCK|ONEPIECE|TOPS|BOTTOMS|SKIRT|BRA|PANTY|LINGERIE|BIKINI|SWIM|UNDERWEAR|下着|服|靴|衣装|パンツ|ブラ/i;
 const KEEP_BODY_RE = /FACE|BODY|SKIN|HAIR|EYE|TOOTH|MOUTH|NAIL|舌|肌|髪|顔/i;
 
+type MatState = { visible: boolean; transparent: boolean; opacity: number; depthWrite: boolean };
+
+/** Hide/show a material, remembering its original state so "cover up" restores it exactly. */
 function hideMat(mat: THREE.Material, visible: boolean) {
-  mat.visible = visible;
-  mat.transparent = !visible || mat.transparent;
-  (mat as THREE.MeshBasicMaterial).opacity = visible ? 1 : 0;
-  mat.depthWrite = visible;
+  const ud = mat.userData as { __petOrig?: MatState };
+  if (!ud.__petOrig) {
+    ud.__petOrig = {
+      visible: mat.visible,
+      transparent: mat.transparent,
+      opacity: (mat as THREE.MeshBasicMaterial).opacity ?? 1,
+      depthWrite: mat.depthWrite,
+    };
+  }
+  const o = ud.__petOrig;
+  if (visible) {
+    mat.visible = o.visible;
+    mat.transparent = o.transparent;
+    (mat as THREE.MeshBasicMaterial).opacity = o.opacity;
+    mat.depthWrite = o.depthWrite;
+  } else {
+    mat.visible = false;
+  }
   mat.needsUpdate = true;
 }
 
@@ -68,49 +113,103 @@ function setClothVisible(root: THREE.Object3D, visible: boolean) {
   });
 }
 
-async function tryLoadClip(url: string, vrm: VRM): Promise<THREE.AnimationClip | null> {
-  try {
-    return await loadMixamoAnimation(url, vrm);
-  } catch (err) {
-    console.warn("[pet] clip load failed", url, err);
-    return null;
+async function tryLoadClip(urls: readonly string[], vrm: VRM): Promise<THREE.AnimationClip | null> {
+  for (const url of urls) {
+    try {
+      return await loadMixamoAnimation(url, vrm);
+    } catch {
+      // Missing / not-a-Mixamo file → next candidate, then procedural fallback.
+    }
   }
+  return null;
 }
 
+/** Mood → target expression weights (only applied when the model has them). */
+function moodExpressions(m: PetMood, flash: boolean): Record<string, number> {
+  const base: Record<string, number> = { happy: 0, relaxed: 0, sad: 0, angry: 0, surprised: 0 };
+  switch (m) {
+    case "happy":
+      base.happy = 0.55;
+      break;
+    case "speaking":
+      base.happy = 0.18;
+      base.relaxed = 0.1;
+      break;
+    case "listening":
+      base.surprised = 0.12;
+      base.relaxed = 0.08;
+      break;
+    case "thinking":
+      base.relaxed = 0.15;
+      break;
+    case "confused":
+      base.surprised = 0.25;
+      base.sad = 0.08;
+      break;
+    case "annoyed":
+      base.angry = 0.45;
+      break;
+    case "sad":
+      base.sad = 0.5;
+      break;
+    case "sleeping":
+      base.relaxed = 0.35;
+      break;
+    case "error":
+      base.sad = 0.25;
+      base.surprised = 0.12;
+      break;
+    default:
+      // Chill resting face: a hint of a smirk, not a beaming grin.
+      base.relaxed = 0.18;
+      base.happy = 0.1;
+  }
+  if (flash) base.happy = Math.max(base.happy, 0.45);
+  return base;
+}
+
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+const damp = (cur: number, target: number, rate: number, dt: number) =>
+  cur + (target - cur) * (1 - Math.exp(-rate * dt));
+
+type CursorSample = { x: number; y: number; width: number; height: number; inside: boolean; movedAt: number };
+
 /**
- * VRM + Mixamo clips. Roams the desktop regularly (walk clip + window move via
- * onWalkStart). Clean neutral lighting (no muddy tone mapping).
- *
- * FLASH HONESTY:
- * There is NO dedicated Flash.fbx / strip / topless Mixamo clip in
- * public/animations/. A true "pull up top / flash breasts" needs a custom
- * VRMA or Mixamo FBX (e.g. public/animations/Flash.fbx) authored in Blender
- * or Mixamo with arms lifting the garment. Until that file exists we
- * APPROXIMATE: play Waving / Talking_2 / Looking_Around (best upper-body
- * arm motion available) + hard-hide CLOTH + happy expression + spoken line.
- * TODO(user): drop a Flash.fbx (or Flash.vrma) into public/animations/ and
- * wire it as ANIM.flash — do not claim a real flash clip exists until then.
+ * VRM + Mixamo clips + procedural life layer:
+ *  - behaviour state machine (idle / wander / look-at-user / react / sleep)
+ *  - head/neck/chest look-at that follows the global cursor
+ *  - breathing + weight shift, mood → expressions, talking mouth
+ * Clean neutral lighting: NoToneMapping + white lights (no ACES, no warm/cheek/rim hacks).
  */
 export function CompanionVRM({
   mood,
   className,
   modelUrl = "/models/companion.vrm",
   flash = false,
+  roamEnabled = true,
+  reactKey = 0,
   onWalkStart,
   onWalkEnd,
+  roamControl,
 }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
   const moodRef = useRef(mood);
   const flashRef = useRef(flash);
+  const roamEnabledRef = useRef(roamEnabled);
+  const reactKeyRef = useRef(reactKey);
   const vrmRef = useRef<VRM | null>(null);
   const onWalkStartRef = useRef(onWalkStart);
   const onWalkEndRef = useRef(onWalkEnd);
+  const roamControlRef = useRef(roamControl);
   const prevFlashRef = useRef(false); // false so mount-with-flash (r18 switch) still fires gesture
   const flashGestureRef = useRef(false);
   moodRef.current = mood;
   flashRef.current = flash;
+  roamEnabledRef.current = roamEnabled;
+  reactKeyRef.current = reactKey;
   onWalkStartRef.current = onWalkStart;
   onWalkEndRef.current = onWalkEnd;
+  roamControlRef.current = roamControl;
 
   useEffect(() => {
     const v = vrmRef.current;
@@ -134,16 +233,16 @@ export function CompanionVRM({
     const renderer = new THREE.WebGLRenderer({
       antialias: true,
       alpha: true,
-      powerPreference: "high-performance",
+      powerPreference: "low-power",
     });
-    renderer.setPixelRatio(Math.min(Math.max(window.devicePixelRatio || 1, 1), 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO));
     renderer.setClearColor(0x000000, 0);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     // Keep NoToneMapping + neutral white lights — ACES / warm/cheek/rim muddied skins brown
     renderer.toneMapping = THREE.NoToneMapping;
     el.appendChild(renderer.domElement);
 
-    const maxAniso = Math.min(renderer.capabilities.getMaxAnisotropy?.() ?? 4, 8);
+    const maxAniso = Math.min(renderer.capabilities.getMaxAnisotropy?.() ?? 4, 4);
 
     scene.add(new THREE.HemisphereLight(0xffffff, 0x99aabb, 1.25));
     const key = new THREE.DirectionalLight(0xffffff, 1.3);
@@ -162,15 +261,34 @@ export function CompanionVRM({
     let vrm: VRM | null = null;
     let mixer: THREE.AnimationMixer | null = null;
     const actions: Partial<Record<ClipKey, THREE.AnimationAction>> = {};
-    let current: ClipKey = "idle";
+    let current: ClipKey | null = null;
     let frame = 0;
     let disposed = false;
-    let blinkUntil = 0;
-    let nextBlink = 1.5;
-    let modeUntil = 2 + Math.random() * 4;
-    let lookSide = 1;
+    let paused = false;
+    let mirror = 1; // VRM0 normalized rig: x/z rotations flip sign
+    const available = new Set<string>();
+
+    // --- behaviour state ---------------------------------------------------
+    let t = 0;
+    let beh: Behaviour = "idle";
+    let behUntil = 3 + Math.random() * 3;
+    let idleVariant: "plain" | "look" = "plain";
     let facing: 1 | -1 = 1;
     let walkNotified = false;
+    let reactFrom = -10;
+    let lastReactKey = reactKeyRef.current;
+    let lastMood: PetMood = moodRef.current;
+    let blinkUntil = 0;
+    let nextBlink = 1.5;
+    let glanceSide = 1;
+    const expr: Record<string, number> = {};
+    // smoothed procedural look
+    let lookYaw = 0;
+    let lookPitch = 0;
+    let bodyYaw = 0;
+    let sleepBlend = 0;
+
+    const cursor: CursorSample = { x: 0, y: 0, width: 1, height: 1, inside: false, movedAt: -1e9 };
 
     const resize = () => {
       const w = el.clientWidth || 320;
@@ -184,34 +302,91 @@ export function CompanionVRM({
     ro.observe(el);
 
     const crossfade = (to: ClipKey, fade = 0.35) => {
-      if (to === current && actions[to]?.isRunning()) return;
       const next = actions[to];
-      if (!next) return;
-      const prev = actions[current];
+      if (!next) return false;
+      if (to === current && next.isRunning()) return true;
+      const prev = current ? actions[current] : undefined;
       next.reset().setEffectiveWeight(1).fadeIn(fade).play();
       if (prev && prev !== next) prev.fadeOut(fade);
       current = to;
+      return true;
     };
 
-    const playOnce = (key: ClipKey, then: ClipKey = "idle") => {
-      const act = actions[key];
+    const playOnce = (k: ClipKey, then: ClipKey = "idle") => {
+      const act = actions[k];
       if (!act) {
         crossfade(then);
-        return;
+        return false;
       }
       act.reset();
       act.setLoop(THREE.LoopOnce, 1);
       act.clampWhenFinished = true;
-      crossfade(key, 0.25);
+      crossfade(k, 0.25);
       const onFinished = (e: { action: THREE.AnimationAction }) => {
         if (e.action !== act) return;
         mixer?.removeEventListener("finished", onFinished);
         act.setLoop(THREE.LoopRepeat, Infinity);
-        crossfade(then, 0.35);
+        if (current === k) crossfade(actions[then] ? then : "idle", 0.35);
       };
       mixer?.addEventListener("finished", onFinished);
+      return true;
     };
 
+    const endWalk = () => {
+      if (walkNotified) {
+        walkNotified = false;
+        onWalkEndRef.current?.();
+      }
+    };
+
+    const enter = (next: Behaviour, duration: number) => {
+      if (beh === "wander" && next !== "wander") endWalk();
+      beh = next;
+      behUntil = t + duration;
+    };
+
+    // --- cursor polling (global cursor via Rust; DOM fallback in browser preview) ---
+    let cursorTimer = 0;
+    let rustCursor = true;
+    const onMouseMove = (e: MouseEvent) => {
+      if (rustCursor) return;
+      const nx = e.clientX;
+      const ny = e.clientY;
+      if (Math.abs(nx - cursor.x) + Math.abs(ny - cursor.y) > 2) cursor.movedAt = t;
+      cursor.x = nx;
+      cursor.y = ny;
+      cursor.width = window.innerWidth;
+      cursor.height = window.innerHeight;
+      cursor.inside = true;
+    };
+    window.addEventListener("mousemove", onMouseMove);
+    const pollCursor = async () => {
+      if (disposed) return;
+      if (!paused && rustCursor) {
+        try {
+          const c = await invoke<{ x: number; y: number; width: number; height: number; inside: boolean }>("cursor_relative");
+          if (Math.abs(c.x - cursor.x) + Math.abs(c.y - cursor.y) > 2) cursor.movedAt = t;
+          cursor.x = c.x;
+          cursor.y = c.y;
+          cursor.width = c.width || 1;
+          cursor.height = c.height || 1;
+          cursor.inside = c.inside;
+        } catch {
+          rustCursor = false; // not in Tauri → DOM events
+        }
+      }
+      if (disposed) return;
+      cursorTimer = window.setTimeout(() => void pollCursor(), beh === "sleep" ? CURSOR_POLL_SLEEP_MS : CURSOR_POLL_MS);
+    };
+    void pollCursor();
+
+    const cursorNear = () => {
+      const { x, y, width, height } = cursor;
+      const near = x > -NEAR_PX && y > -NEAR_PX && x < width + NEAR_PX && y < height + NEAR_PX;
+      return near && t - cursor.movedAt < 4;
+    };
+
+    // --- load model + clips --------------------------------------------------
     const loader = new GLTFLoader();
     loader.register((parser) => new VRMLoaderPlugin(parser));
 
@@ -230,6 +405,7 @@ export function CompanionVRM({
         }
         if (loaded.meta?.metaVersion === "0") {
           VRMUtils.rotateVRM0(loaded);
+          mirror = -1;
         }
         loaded.scene.traverse((o) => {
           o.frustumCulled = false;
@@ -239,14 +415,7 @@ export function CompanionVRM({
           for (const mat of mats) {
             if (!mat) continue;
             const m = mat as THREE.MeshStandardMaterial;
-            for (const texKey of [
-              "map",
-              "normalMap",
-              "roughnessMap",
-              "metalnessMap",
-              "emissiveMap",
-              "aoMap",
-            ] as const) {
+            for (const texKey of ["map", "normalMap", "emissiveMap"] as const) {
               const tex = m[texKey];
               if (tex && "anisotropy" in tex) {
                 tex.anisotropy = maxAniso;
@@ -275,182 +444,309 @@ export function CompanionVRM({
         setClothVisible(loaded.scene, !flashRef.current);
         mixer = new THREE.AnimationMixer(loaded.scene);
 
-        const [idleClip, lookClip, walkClip, waveClip, talkClip, thinkClip] =
-          await Promise.all([
-            (async () =>
-              (await tryLoadClip(ANIM.idle, loaded)) ??
-              (await tryLoadClip(ANIM.idleFallback, loaded)))(),
-            tryLoadClip(ANIM.look, loaded),
-            tryLoadClip(ANIM.walk, loaded),
-            tryLoadClip(ANIM.wave, loaded),
-            tryLoadClip(ANIM.talk, loaded),
-            tryLoadClip(ANIM.think, loaded),
-          ]);
-        if (disposed || !mixer) return;
+        const em = loaded.expressionManager;
+        for (const n of ["happy", "relaxed", "sad", "angry", "surprised", "aa", "oh", "ih", "blink"]) {
+          if (em?.getExpression(n)) available.add(n);
+        }
 
-        const bind = (key: ClipKey, clip: THREE.AnimationClip | null, loop: boolean) => {
+        const keys = Object.keys(ANIM) as ClipKey[];
+        const clips = await Promise.all(keys.map((k) => tryLoadClip(ANIM[k], loaded)));
+        if (disposed || !mixer) return;
+        keys.forEach((k, i) => {
+          const clip = clips[i];
           if (!clip || !mixer) return;
           const a = mixer.clipAction(clip);
+          const loop = k !== "wave";
           a.setLoop(loop ? THREE.LoopRepeat : THREE.LoopOnce, loop ? Infinity : 1);
-          actions[key] = a;
-        };
-        bind("idle", idleClip, true);
-        bind("look", lookClip, true);
-        bind("walk", walkClip, true);
-        bind("wave", waveClip, false);
-        bind("talk", talkClip, true);
-        bind("think", thinkClip, true);
+          actions[k] = a;
+        });
 
-        if (actions.idle) {
-          actions.idle.play();
-          current = "idle";
-        } else if (actions.look) {
-          actions.look.play();
-          current = "look";
-        }
-        console.info("[pet] ready v", PET_VRM_VERSION, modelUrl, Object.keys(actions));
+        if (actions.idle) crossfade("idle", 0.01);
+        else if (actions.look) crossfade("look", 0.01);
+        console.info("[pet] ready v", PET_VRM_VERSION, modelUrl, "clips:", Object.keys(actions), "expr:", [...available]);
         if (flashRef.current) flashGestureRef.current = true;
       } catch (err) {
         console.error("[pet] load failed", err);
       }
     })();
 
-    const clock = new THREE.Clock();
-    const tick = () => {
-      frame = requestAnimationFrame(tick);
-      const dt = Math.min(clock.getDelta(), 0.05);
-      const t = clock.elapsedTime;
+    // --- procedural bones ---------------------------------------------------
+    const PROC_BONES: VRMHumanBoneName[] = ["head", "neck", "upperChest", "chest", "spine", "leftUpperArm", "rightUpperArm", "leftLowerArm", "rightLowerArm"];
+    const qTmp = new THREE.Quaternion();
+    const eTmp = new THREE.Euler();
+    const bone = (n: VRMHumanBoneName) => vrm?.humanoid.getNormalizedBoneNode(n) ?? null;
+    const addRot = (n: VRMHumanBoneName, x: number, y: number, z: number) => {
+      const b = bone(n);
+      if (!b) return;
+      eTmp.set(x * mirror, y, z * mirror, "YXZ");
+      b.quaternion.multiply(qTmp.setFromEuler(eTmp));
+    };
+    const lookTarget = new THREE.Vector3();
+
+    const setExpr = (n: string, v: number) => {
+      if (available.has(n)) vrm?.expressionManager?.setValue(n, v);
+    };
+
+    // --- behaviour state machine (runs on its own clock, independent of React) ---
+    const updateBehaviour = () => {
       const m = moodRef.current;
+      const engaged = m === "speaking" || m === "listening" || m === "thinking";
+      const near = cursorNear();
+      const rc = roamControlRef.current?.current;
 
-      if (vrm && mixer) {
-        // One-shot flash gesture approximation (no Flash.fbx on disk).
-        if (flashGestureRef.current) {
-          flashGestureRef.current = false;
-          const gesture: ClipKey = actions.wave
-            ? "wave"
-            : actions.talk
-              ? "talk"
-              : actions.look
-                ? "look"
-                : "idle";
-          if (current === "walk" && walkNotified) {
-            walkNotified = false;
-            onWalkEndRef.current?.();
-          }
-          playOnce(gesture, "idle");
-          modeUntil = t + 3.5;
+      if (flashGestureRef.current) {
+        flashGestureRef.current = false;
+        enter("react", 3.5);
+        reactFrom = t;
+        if (!playOnce("wave", "idle")) {
+          if (!crossfade("talk")) crossfade("idle");
         }
-
-        const engaged = m === "speaking" || m === "listening" || m === "thinking";
-
-        if (t > modeUntil && !flashGestureRef.current) {
-          if (current === "walk") {
-            crossfade(actions.look ? "look" : "idle");
-            if (walkNotified) {
-              walkNotified = false;
-              onWalkEndRef.current?.();
-            }
-            // Idle / look-around dwell 8–20s between strolls
-            modeUntil = t + 8 + Math.random() * 12;
-            lookSide *= -1;
-          } else if (engaged) {
-            if (m === "speaking" && actions.talk) crossfade("talk");
-            else if (m === "thinking" && actions.think) crossfade("think");
-            else crossfade(actions.look ? "look" : "idle");
-            if (walkNotified) {
-              walkNotified = false;
-              onWalkEndRef.current?.();
-            }
-            modeUntil = t + 1.2;
-          } else {
-            // Regular desktop roam: walk often (override old rare-stroll pref)
-            const roll = Math.random();
-            if (roll < 0.55 && actions.walk) {
-              facing = (Math.random() < 0.5 ? 1 : -1) as 1 | -1;
-              const durationMs = 3000 + Math.floor(Math.random() * 3000); // 3–6s
-              crossfade("walk");
-              walkNotified = true;
-              onWalkStartRef.current?.({ facing, durationMs });
-              modeUntil = t + durationMs / 1000;
-            } else if (roll < 0.7 && actions.wave) {
-              playOnce("wave", actions.look ? "look" : "idle");
-              modeUntil = t + 4 + Math.random() * 3;
-            } else if (actions.look) {
-              crossfade("look");
-              modeUntil = t + 6 + Math.random() * 8;
-              lookSide *= -1;
-            } else {
-              crossfade("idle");
-              modeUntil = t + 8 + Math.random() * 8;
-            }
-          }
-        } else if (engaged && current === "walk") {
-          // Interrupt roam when user engages
-          crossfade(
-            m === "speaking" && actions.talk
-              ? "talk"
-              : m === "thinking" && actions.think
-                ? "think"
-                : actions.look
-                  ? "look"
-                  : "idle",
-          );
-          if (walkNotified) {
-            walkNotified = false;
-            onWalkEndRef.current?.();
-          }
-          modeUntil = t + 1.5;
-        } else if (engaged) {
-          // Keep mood clip sticky while speaking/listening/thinking
-          if (m === "speaking" && actions.talk && current !== "talk" && current !== "wave") {
-            crossfade("talk");
-          } else if (m === "thinking" && actions.think && current !== "think") {
-            crossfade("think");
-          }
-        }
-
-        mixer.update(dt);
-        vrm.update(dt);
-
-        if (t > nextBlink) {
-          blinkUntil = t + 0.09;
-          nextBlink = t + 1.8 + Math.random() * 3.2;
-        }
-        const em = vrm.expressionManager;
-        if (em) {
-          em.setValue("blink", t < blinkUntil ? 1 : 0);
-          const happyBase =
-            m === "happy" || flashRef.current ? 0.58 : m === "speaking" ? 0.4 : 0.28;
-          em.setValue("happy", happyBase);
-          em.setValue("aa", m === "speaking" ? 0.18 + Math.abs(Math.sin(t * 9)) * 0.4 : 0);
-          em.setValue("surprised", m === "listening" ? 0.12 : flashRef.current ? 0.08 : 0);
-          em.setValue("angry", 0);
-          em.setValue("sad", 0);
-        }
-
-        // Face roam direction while walking; soft sway + glance when idle
-        if (current === "walk") {
-          root.rotation.set(0, facing > 0 ? 0.55 : -0.55, 0);
-          vrm.lookAt?.lookAt(new THREE.Vector3(facing * 0.6, 1.05, 1.0));
-        } else {
-          const sway = Math.sin(t * 0.35) * 0.04;
-          root.rotation.set(0, Math.sin(t * 0.18) * 0.08 + sway, sway * 0.3);
-          const glanceX =
-            engaged ? 0 : Math.sin(t * 0.22) * 0.28 * lookSide;
-          vrm.lookAt?.lookAt(new THREE.Vector3(glanceX, 1.05, engaged ? 1.6 : 1.2));
-        }
+        return;
       }
 
-      camera.up.set(0, 1, 0);
+      // Reactions: explicit poke, or an emotional mood change.
+      const moodChanged = m !== lastMood;
+      const emotional = m === "happy" || m === "annoyed" || m === "sad" || m === "confused" || m === "error";
+      if (reactKeyRef.current !== lastReactKey || (moodChanged && emotional && beh !== "sleep")) {
+        lastReactKey = reactKeyRef.current;
+        lastMood = m;
+        enter("react", 1.8);
+        reactFrom = t;
+        if (m === "happy" || !moodChanged) playOnce("wave", "idle");
+        return;
+      }
+      lastMood = m;
+
+      if (m === "sleeping" && !engaged) {
+        if (beh !== "sleep") {
+          enter("sleep", 1e9);
+          if (!crossfade("sleep", 1.2)) if (!crossfade("sit", 1.2)) crossfade("idle", 1.2);
+        }
+        return;
+      }
+      if (beh === "sleep") {
+        // Woke up: a little stretch/nod, then attentive.
+        enter("react", 1.6);
+        reactFrom = t;
+        crossfade("idle", 0.8);
+        return;
+      }
+
+      if (beh === "react" && t < behUntil) return;
+
+      if (engaged || near) {
+        if (beh !== "look") enter("look", 2);
+        behUntil = t + 2;
+        const want: ClipKey = m === "speaking" && actions.talk ? "talk" : m === "thinking" && actions.think ? "think" : "idle";
+        if (current !== want && current !== "wave") crossfade(want);
+        return;
+      }
+
+      if (beh === "wander") {
+        if (rc && rc.facing !== null && rc.facing !== 0) facing = rc.facing;
+        const hostEnded = rc ? rc.facing === 0 : false;
+        if (hostEnded || t > behUntil || !roamEnabledRef.current) {
+          enter("idle", 8 + Math.random() * 10);
+          idleVariant = "plain";
+          crossfade("idle");
+        }
+        return;
+      }
+
+      if (t > behUntil) {
+        const roll = Math.random();
+        if (roll < 0.45 && roamEnabledRef.current && actions.walk && onWalkStartRef.current) {
+          const durationMs = 3000 + Math.floor(Math.random() * 3000);
+          facing = Math.random() < 0.5 ? 1 : -1;
+          if (rc) rc.facing = null;
+          enter("wander", durationMs / 1000 + 1.5);
+          crossfade("walk");
+          walkNotified = true;
+          onWalkStartRef.current({ facing, durationMs });
+        } else if (roll < 0.7) {
+          enter("idle", 6 + Math.random() * 8);
+          idleVariant = "look";
+          glanceSide *= -1;
+          if (!crossfade("look")) crossfade("idle");
+        } else {
+          enter("idle", 7 + Math.random() * 9);
+          idleVariant = "plain";
+          crossfade("idle");
+        }
+      }
+    };
+
+    const applyProcedural = (dt: number) => {
+      if (!vrm) return;
+      const m = moodRef.current;
+      const engaged = m === "speaking" || m === "listening" || m === "thinking";
+      const sleeping = beh === "sleep";
+      sleepBlend = damp(sleepBlend, sleeping ? 1 : 0, 1.5, dt);
+
+      // Target look (yaw/pitch, radians) from cursor relative to her head.
+      let tYaw = 0;
+      let tPitch = 0;
+      const headX = cursor.width * 0.5;
+      const headY = cursor.height * 0.22;
+      const dx = cursor.x - headX;
+      const dy = cursor.y - headY;
+      const follow = beh === "look" ? 1 : beh === "wander" || sleeping ? 0 : 0.45;
+      if (follow > 0 && t - cursor.movedAt < 8) {
+        tYaw = clamp(Math.atan2(dx, 700), -0.75, 0.75) * follow;
+        tPitch = clamp(Math.atan2(dy, 900), -0.35, 0.45) * follow;
+      }
+      if (beh === "idle" && idleVariant === "look" && !actions.look) {
+        // Procedural look-around when the clip is missing.
+        tYaw += Math.sin(t * 0.5) * 0.45 * glanceSide;
+        tPitch += Math.sin(t * 0.31) * 0.06;
+      } else if (beh === "idle" && follow < 1) {
+        tYaw += Math.sin(t * 0.22) * 0.12 * glanceSide;
+      }
+      if (m === "thinking") {
+        tYaw += -0.25;
+        tPitch += -0.15;
+      }
+
+      // React: quick nod + tilt when there's no Waving clip carrying it.
+      let nod = 0;
+      let tilt = 0;
+      const rt = t - reactFrom;
+      if (beh === "react" && rt < 1.8) {
+        const env = Math.sin(Math.min(1, rt / 1.8) * Math.PI);
+        nod = Math.sin(rt * 9) * 0.08 * env;
+        tilt = 0.12 * env * (m === "confused" ? 1.6 : 1);
+      }
+      if (m === "confused") tilt += 0.1;
+      if (m === "listening") tilt += 0.06;
+
+      lookYaw = damp(lookYaw, tYaw, 5, dt);
+      lookPitch = damp(lookPitch, tPitch, 5, dt);
+
+      // Sleep pose: head down, slow breath.
+      const sleepPitch = 0.38 * sleepBlend;
+      const breathRate = sleeping ? 0.9 : engaged ? 1.9 : 1.5;
+      const breath = Math.sin(t * breathRate * Math.PI * 0.5);
+
+      addRot("neck", lookPitch * 0.4 + sleepPitch * 0.5, lookYaw * 0.4, tilt * 0.4);
+      addRot("head", lookPitch * 0.6 + nod + sleepPitch * 0.5, lookYaw * 0.6, tilt * 0.6);
+      addRot("upperChest", breath * 0.012, lookYaw * 0.12, 0);
+      addRot("chest", breath * 0.01 + sleepBlend * 0.08, 0, 0);
+      // Weight shift.
+      addRot("spine", 0, 0, Math.sin(t * 0.45) * 0.02 * (1 - sleepBlend));
+
+      // No idle clip at all → don't T-pose: arms down, relaxed elbows.
+      if (!actions.idle && !actions.look && current !== "walk") {
+        addRot("leftUpperArm", 0, 0, -1.2 + breath * 0.01);
+        addRot("rightUpperArm", 0, 0, 1.2 - breath * 0.01);
+        addRot("leftLowerArm", 0, -0.15, 0);
+        addRot("rightLowerArm", 0, 0.15, 0);
+      }
+
+      // Body turn: face walk direction, else subtly toward the cursor.
+      const walkTurn = beh === "wander" && current === "walk" ? facing * 0.8 : 0;
+      bodyYaw = damp(bodyYaw, walkTurn || lookYaw * 0.25 + Math.sin(t * 0.18) * 0.05, 3, dt);
+      root.rotation.set(0, bodyYaw, 0);
+
+      // Eyes.
+      const headNode = bone("head");
+      if (headNode && vrm.lookAt) {
+        headNode.getWorldPosition(lookTarget);
+        lookTarget.x += Math.sin(lookYaw * 1.3) * 1.5;
+        lookTarget.y -= Math.sin(lookPitch * 1.3) * 1.5;
+        lookTarget.z += 1.5;
+        vrm.lookAt.lookAt(lookTarget);
+      }
+    };
+
+    const applyExpressions = (dt: number) => {
+      if (!vrm?.expressionManager) return;
+      const m = moodRef.current;
+      const target = moodExpressions(beh === "sleep" ? "sleeping" : m, flashRef.current);
+      for (const [n, v] of Object.entries(target)) {
+        expr[n] = damp(expr[n] ?? 0, v, 4, dt);
+        setExpr(n, expr[n]);
+      }
+      // Blink (eyes stay shut while asleep).
+      if (t > nextBlink) {
+        blinkUntil = t + 0.1;
+        nextBlink = t + 1.8 + Math.random() * 3.4;
+      }
+      setExpr("blink", Math.max(t < blinkUntil ? 1 : 0, sleepBlend));
+      // Talking mouth driven by speaking state.
+      const talking = m === "speaking";
+      const mouth = talking ? 0.12 + Math.abs(Math.sin(t * 9.5)) * 0.38 * (0.75 + 0.25 * Math.sin(t * 2.3)) : 0;
+      expr.aa = damp(expr.aa ?? 0, mouth, 18, dt);
+      setExpr("aa", expr.aa);
+      expr.oh = damp(expr.oh ?? 0, talking ? Math.max(0, Math.sin(t * 4.1)) * 0.18 : 0, 12, dt);
+      setExpr("oh", expr.oh);
+    };
+
+    // --- render loop: capped fps, paused when hidden/minimized ---------------
+    const clock = new THREE.Clock();
+    const frameInterval = 1 / TARGET_FPS;
+    let acc = 0;
+    const tick = () => {
+      frame = requestAnimationFrame(tick);
+      acc += clock.getDelta();
+      if (acc < frameInterval - 0.002) return;
+      const dt = Math.min(acc, 0.1);
+      acc = 0;
+      t += dt;
+
+      if (vrm && mixer) {
+        updateBehaviour();
+        // Reset procedural bones to rest so clip tracks (or nothing) define the base pose.
+        for (const n of PROC_BONES) bone(n)?.quaternion.identity();
+        mixer.update(dt);
+        applyProcedural(dt);
+        applyExpressions(dt);
+        vrm.update(dt);
+      }
       renderer.render(scene, camera);
     };
-    tick();
+
+    const start = () => {
+      if (disposed || !paused) return;
+      paused = false;
+      clock.getDelta(); // drop the time spent hidden
+      acc = 0;
+      frame = requestAnimationFrame(tick);
+    };
+    const stop = () => {
+      if (paused) return;
+      paused = true;
+      cancelAnimationFrame(frame);
+    };
+    paused = true;
+    start();
+
+    const onVisibility = () => (document.hidden ? stop() : start());
+    document.addEventListener("visibilitychange", onVisibility);
+
+    // Minimized / hidden-to-tray windows don't always flip document.hidden in WebView2.
+    let visTimer = 0;
+    const checkWindow = async () => {
+      try {
+        const w = getCurrentWindow();
+        const [min, vis] = await Promise.all([w.isMinimized(), w.isVisible()]);
+        if (min || !vis || document.hidden) stop();
+        else start();
+      } catch {
+        // browser preview
+      }
+      if (!disposed) visTimer = window.setTimeout(() => void checkWindow(), 2000);
+    };
+    void checkWindow();
 
     return () => {
       disposed = true;
       cancelAnimationFrame(frame);
+      window.clearTimeout(cursorTimer);
+      window.clearTimeout(visTimer);
+      window.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("visibilitychange", onVisibility);
       ro.disconnect();
-      if (walkNotified) onWalkEndRef.current?.();
+      endWalk();
       mixer?.stopAllAction();
       vrmRef.current = null;
       if (vrm) {

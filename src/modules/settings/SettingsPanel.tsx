@@ -1,12 +1,20 @@
 import { FormEvent, useEffect, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { isEnabled as autostartIsEnabled } from "@tauri-apps/plugin-autostart";
 import type { MemoryFact, PublicSettings } from "../../types";
 import { clearApiKey, saveApiKey, saveSettings } from "./settingsApi";
 import { deleteMemory, listMemories } from "../memory/memoryApi";
 import "./SettingsPanel.css";
 
+const VOICES = [
+  { id: "en-HK-YanNeural", label: "Yan (HK English) — default" },
+  { id: "en-SG-LunaNeural", label: "Luna (SG English)" },
+  { id: "en-US-AvaNeural", label: "Ava (US English)" },
+  { id: "en-US-AriaNeural", label: "Aria (US English)" },
+];
+
 const PERSONALITIES = [
-  { id: "chill", label: "Chill 18 (English)" },
+  { id: "chill", label: "Chill 18, flirty (English)" },
   { id: "firstdate", label: "First date" },
   { id: "cosmic", label: "Cosmic companion" },
   { id: "witty", label: "Witty" },
@@ -20,9 +28,12 @@ interface Props {
   models: string[];
   onClose: () => void;
   onSaved: (s: PublicSettings) => void;
+  /** Wipes the on-screen / stored conversation (memories are separate). */
+  onClearChat: () => void;
+  chatCount: number;
 }
 
-export function SettingsPanel({ settings, models, onClose, onSaved }: Props) {
+export function SettingsPanel({ settings, models, onClose, onSaved, onClearChat, chatCount }: Props) {
   const [apiKey, setApiKey] = useState("");
   const [name, setName] = useState(settings.companionName);
   const [model, setModel] = useState(settings.model);
@@ -34,12 +45,19 @@ export function SettingsPanel({ settings, models, onClose, onSaved }: Props) {
   const [temperature, setTemperature] = useState(settings.temperature);
   const [maxTokens, setMaxTokens] = useState(settings.maxTokens);
   const [brainProvider, setBrainProvider] = useState(settings.brainProvider || "grok-cli");
+  const [voiceTarget, setVoiceTarget] = useState(settings.voiceTarget || "en-HK-YanNeural");
+  const [autostart, setAutostart] = useState(settings.autostart);
+  const [roamEnabled, setRoamEnabled] = useState(settings.roamEnabled);
+  const [wakeWordEnabled, setWakeWordEnabled] = useState(settings.wakeWordEnabled);
+  const [autostartOs, setAutostartOs] = useState<boolean | null>(null);
+  const [confirmClear, setConfirmClear] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [facts, setFacts] = useState<MemoryFact[]>([]);
 
   useEffect(() => {
     listMemories().then(setFacts).catch(() => setFacts([]));
+    autostartIsEnabled().then(setAutostartOs).catch(() => setAutostartOs(null));
   }, []);
 
   const save = async (e: FormEvent) => {
@@ -58,9 +76,13 @@ export function SettingsPanel({ settings, models, onClose, onSaved }: Props) {
         temperature,
         maxTokens,
         brainProvider,
-        voiceTarget: settings.voiceTarget || 'en-HK-YanNeural',
-        characterModel: settings.characterModel || '',
+        voiceTarget: voiceTarget || "en-HK-YanNeural",
+        characterModel: settings.characterModel || "",
+        autostart,
+        roamEnabled,
+        wakeWordEnabled,
       });
+      autostartIsEnabled().then(setAutostartOs).catch(() => undefined);
       if (apiKey.trim()) {
         next = await saveApiKey(apiKey.trim());
         setApiKey("");
@@ -167,6 +189,17 @@ export function SettingsPanel({ settings, models, onClose, onSaved }: Props) {
         )}
 
         <label>
+          Voice (Edge neural)
+          <select value={voiceTarget} onChange={(e) => setVoiceTarget(e.target.value)}>
+            {[...VOICES, ...(VOICES.some((v) => v.id === voiceTarget) ? [] : [{ id: voiceTarget, label: voiceTarget }])].map((v) => (
+              <option key={v.id} value={v.id}>
+                {v.label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label>
           System prompt
           <textarea value={systemPrompt} onChange={(e) => setSystemPrompt(e.target.value)} rows={4} />
         </label>
@@ -184,7 +217,24 @@ export function SettingsPanel({ settings, models, onClose, onSaved }: Props) {
             <input type="checkbox" checked={autoSpeak} onChange={(e) => setAutoSpeak(e.target.checked)} />
             Auto-speak replies
           </label>
+          <label className="check">
+            <input type="checkbox" checked={wakeWordEnabled} onChange={(e) => setWakeWordEnabled(e.target.checked)} />
+            “Hey” wake word
+          </label>
+          <label className="check">
+            <input type="checkbox" checked={roamEnabled} onChange={(e) => setRoamEnabled(e.target.checked)} />
+            Roam the desktop
+          </label>
+          <label className="check">
+            <input type="checkbox" checked={autostart} onChange={(e) => setAutostart(e.target.checked)} />
+            Launch with Windows
+          </label>
         </div>
+        {autostartOs !== null && autostartOs !== autostart && (
+          <p className="fine">
+            Launch-at-login is currently {autostartOs ? "on" : "off"} in Windows; Save to apply (dev builds never register).
+          </p>
+        )}
 
         <label>
           Temperature {temperature.toFixed(2)}
@@ -225,6 +275,29 @@ export function SettingsPanel({ settings, models, onClose, onSaved }: Props) {
               </li>
             ))}
           </ul>
+        </section>
+
+        <section className="memories">
+          <h3>Chat history</h3>
+          <p className="fine">
+            {chatCount} message{chatCount === 1 ? "" : "s"} on screen. Clearing doesn't touch memories above.
+          </p>
+          <button
+            type="button"
+            className="link danger"
+            onClick={() => {
+              if (!confirmClear) {
+                setConfirmClear(true);
+                window.setTimeout(() => setConfirmClear(false), 4000);
+                return;
+              }
+              setConfirmClear(false);
+              onClearChat();
+              setStatus("Chat history cleared.");
+            }}
+          >
+            {confirmClear ? "Tap again to clear chat history" : "Clear chat history"}
+          </button>
         </section>
 
         {status && <p className="status-msg">{status}</p>}

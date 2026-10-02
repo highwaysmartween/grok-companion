@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Companion } from "./modules/pet/Companion";
+import { listen } from "@tauri-apps/api/event";
+import { Companion, snapToFloor } from "./modules/pet/Companion";
 import { ChatPanel } from "./modules/chat/ChatPanel";
 import { SettingsPanel } from "./modules/settings/SettingsPanel";
 import { StatusBar } from "./modules/status/StatusBar";
 import { useChat } from "./modules/chat/useChat";
 import { useVoice } from "./modules/voice/useVoice";
-import { getSettings } from "./modules/settings/settingsApi";
+import { getSettings, saveSettings, toPayload } from "./modules/settings/settingsApi";
 import { checkConnection } from "./modules/chat/chatApi";
 import type { ConnectionKind, PetMood, PublicSettings } from "./types";
 import "./App.css";
@@ -19,21 +20,23 @@ const FLASH_LINES = [
   "Hmm. Just this once.",
 ];
 
+/** Real inactivity timer (runs on its own interval, not on voice state changes). */
+const SLEEP_AFTER_MS = 120_000;
+const SETTLE_AFTER_MS = 25_000;
+const MOOD_TICK_MS = 3_000;
+const TRANSIENT_MOODS: PetMood[] = ["happy", "confused", "annoyed", "sad", "error"];
+
 function classifyUserMood(raw: string): PetMood {
   const text = raw.toLowerCase();
   if (/(hello|hi|hey|thanks|love|cool|awesome|great|happy|good|nice|amazing|glad|fun|smile)/.test(text)) return "happy";
   if (/(what|why|confused|unclear|huh|lost|not sure|weird|wait|sorry|uncertain)/.test(text)) return "confused";
   if (/(angry|annoyed|ugh|hate|bad|annoying|stupid|damn|furious|upset|irritated)/.test(text)) return "annoyed";
   if (/(sad|down|lonely|tired|cry|hurt|upset|rough|depressed|exhausted)/.test(text)) return "sad";
-  if (/(sleep|nap|bed|night|rest|yawn|drowsy)/.test(text)) return "sleeping";
   return "idle";
 }
 
-function resolveIdleMood(current: PetMood): PetMood {
-  if (current === "idle") return "happy";
-  if (current === "happy") return "idle";
-  return current;
-}
+const findModelIdx = (list: ModelOpt[], key: string | undefined | null) =>
+  key ? list.findIndex((m) => m.id === key || m.file === key) : -1;
 
 export default function App() {
   const [settings, setSettings] = useState<PublicSettings | null>(null);
@@ -48,26 +51,45 @@ export default function App() {
   const [modelsCatalog, setModelsCatalog] = useState<ModelOpt[]>([]);
   const [modelIdx, setModelIdx] = useState(0);
   const [flash, setFlash] = useState(false);
+  const [hovered, setHovered] = useState(false);
+  const [reactKey, setReactKey] = useState(0);
   const preFlashIdx = useRef<number | null>(null);
+  const restoredModel = useRef(false);
   const sendRef = useRef<(text: string, meta?: { fromVoice?: boolean }) => Promise<void>>(async () => undefined);
   const lastInteractionRef = useRef(Date.now());
+  const lastMoveBump = useRef(0);
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
 
   const touchMood = useCallback((next: PetMood) => {
     lastInteractionRef.current = Date.now();
     setMood(next);
   }, []);
 
+  const name = settings?.companionName || "Nova";
+
   const voice = useVoice({
-    wakeWordEnabled: true,
+    wakeWordEnabled: settings ? settings.wakeWordEnabled !== false : false,
     wakeWord: "hey",
+    name,
+    voice: settings?.voiceTarget,
     onFinalTranscript: (text) => {
       setInput("");
-      const nextMood = classifyUserMood(text);
-      touchMood(nextMood);
+      touchMood(classifyUserMood(text));
       void sendRef.current(text, { fromVoice: true });
     },
   });
   const chat = useChat({ settings, setMood: touchMood, speakReply: (text) => voice.speak(plainForSpeech(text)) });
+
+  const persist = useCallback(async (patch: Partial<Parameters<typeof toPayload>[1]>) => {
+    const s = settingsRef.current;
+    if (!s) return;
+    try {
+      setSettings(await saveSettings(toPayload(s, patch)));
+    } catch (err) {
+      console.warn("[app] could not save settings", err);
+    }
+  }, []);
 
   const handleUserText = useCallback(async (text: string, meta?: { fromVoice?: boolean }) => {
     const flashCmd = isFlashCommand(text);
@@ -77,7 +99,7 @@ export default function App() {
       if (!cur || !prefer(cur)) {
         const idx = modelsCatalog.findIndex(prefer);
         if (idx >= 0) {
-          preFlashIdx.current = modelIdx;
+          if (preFlashIdx.current == null) preFlashIdx.current = modelIdx;
           setModelIdx(idx);
         }
       }
@@ -102,41 +124,59 @@ export default function App() {
 
   sendRef.current = handleUserText;
 
+  // Activity-driven moods.
   useEffect(() => {
-    if (voice.listening) {
-      touchMood("listening");
-      return;
-    }
-    if (chat.busy) {
-      touchMood("thinking");
-      return;
-    }
-    if (voice.speaking) {
-      touchMood("speaking");
-      return;
-    }
-
-    const idleSince = Date.now() - lastInteractionRef.current;
-    if (idleSince > 35000) {
-      setMood("sleeping");
-    } else if (idleSince > 15000) {
-      setMood((current) => (current === "idle" ? "happy" : current));
-    }
+    if (voice.listening) touchMood("listening");
+    else if (chat.busy) touchMood("thinking");
+    else if (voice.speaking) touchMood("speaking");
+    else setMood((cur) => (cur === "listening" || cur === "thinking" || cur === "speaking" ? "idle" : cur));
   }, [voice.listening, voice.speaking, chat.busy, touchMood]);
 
+  // Independent inactivity timer → settle transient moods, then sleep.
+  const activeRef = useRef(false);
+  activeRef.current = voice.listening || voice.speaking || chat.busy;
   useEffect(() => {
-    if (voice.listening || voice.speaking || chat.busy) return;
-    const idleTimer = window.setTimeout(() => {
-      setMood((current) => resolveIdleMood(current));
-    }, 7000);
-    return () => window.clearTimeout(idleTimer);
-  }, [voice.listening, voice.speaking, chat.busy, mood]);
+    const id = window.setInterval(() => {
+      if (activeRef.current) return;
+      const idleFor = Date.now() - lastInteractionRef.current;
+      setMood((cur) => {
+        if (idleFor > SLEEP_AFTER_MS) return "sleeping";
+        if (idleFor > SETTLE_AFTER_MS && TRANSIENT_MOODS.includes(cur)) return "idle";
+        return cur;
+      });
+    }, MOOD_TICK_MS);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const bumpActivity = useCallback(() => {
+    const now = Date.now();
+    if (now - lastMoveBump.current < 1000) return;
+    lastMoveBump.current = now;
+    lastInteractionRef.current = now;
+    setMood((cur) => (cur === "sleeping" ? "idle" : cur));
+  }, []);
 
   useEffect(() => {
     void fetch("/models/catalog.json").then((r) => r.json()).then((list: ModelOpt[]) => {
       if (Array.isArray(list) && list.length) setModelsCatalog(list);
     }).catch(() => setModelsCatalog([{ id: "default", name: "Companion", file: "/models/companion.vrm" }]));
   }, []);
+
+  // Restore the chosen character once both settings and catalog are known.
+  useEffect(() => {
+    if (restoredModel.current || !settings || modelsCatalog.length === 0) return;
+    restoredModel.current = true;
+    const idx = findModelIdx(modelsCatalog, settings.characterModel);
+    if (idx >= 0) setModelIdx(idx);
+  }, [settings, modelsCatalog]);
+
+  const nextCharacter = useCallback(() => {
+    if (modelsCatalog.length === 0) return;
+    const idx = (modelIdx + 1) % modelsCatalog.length;
+    preFlashIdx.current = null; // an explicit pick wins over the flash swap
+    setModelIdx(idx);
+    void persist({ characterModel: modelsCatalog[idx]!.id });
+  }, [modelIdx, modelsCatalog, persist]);
 
   const refreshConnection = useCallback(async () => {
     try {
@@ -157,7 +197,12 @@ export default function App() {
         if (cancelled) return;
         setSettings(s);
         if (!s.hasApiKey) setSettingsOpen(true);
-        await getCurrentWindow().setAlwaysOnTop(s.alwaysOnTop);
+        try {
+          await getCurrentWindow().setAlwaysOnTop(s.alwaysOnTop);
+        } catch {
+          // preview
+        }
+        void snapToFloor();
         await refreshConnection();
       } catch (err) {
         if (!cancelled) {
@@ -173,7 +218,20 @@ export default function App() {
     };
   }, [refreshConnection]);
 
-  const name = settings?.companionName || "Nova";
+  // Tray menu → frontend.
+  useEffect(() => {
+    const offs: (() => void)[] = [];
+    let disposed = false;
+    const add = (p: Promise<() => void>) =>
+      p.then((fn) => (disposed ? fn() : offs.push(fn))).catch(() => undefined);
+    add(listen("tray-open-settings", () => setSettingsOpen(true)));
+    add(listen<boolean>("tray-roam", (e) => setSettings((s) => (s ? { ...s, roamEnabled: !!e.payload } : s))));
+    return () => {
+      disposed = true;
+      offs.forEach((fn) => fn());
+    };
+  }, []);
+
   const title = useMemo(() => `${name} — Grok Companion`, [name]);
   const toggleCompact = async () => {
     const next = !compact; setCompact(next); setChatOpen(!next);
@@ -182,33 +240,63 @@ export default function App() {
       const win = getCurrentWindow();
       await win.setSize(new LogicalSize(next ? 440 : 480, next ? 640 : 820));
       await win.setAlwaysOnTop(next || !!settings?.alwaysOnTop);
+      if (next) void snapToFloor();
     } catch {
       // preview/browser fallback
     }
   };
   const sendTyped = () => { const text = input.trim(); if (!text) return; setInput(""); void handleUserText(text); };
-  const wakeHint = voice.listening ? voice.interim || "Listening…" : voice.wakeArmed ? voice.interim || "Say hey…" : voice.speaking ? "Speaking…" : null;
+  const wakeHint = voice.listening ? voice.interim || "Listening…" : voice.wakeArmed ? "Say “hey”…" : voice.speaking ? "Speaking…" : null;
+  const roamEnabled = settings ? settings.roamEnabled !== false : false;
+  const roamPaused = !compact || chatOpen || settingsOpen || hovered;
+  const micActive = voice.listening || voice.speaking;
 
-  return <div className={`shell ${compact ? "is-compact" : ""}`}>
+  return <div
+    className={`shell ${compact ? "is-compact" : ""}`}
+    onMouseEnter={() => setHovered(true)}
+    onMouseLeave={() => setHovered(false)}
+    onMouseMove={bumpActivity}
+  >
     <div className="stars" />
     <header className="titlebar" data-tauri-drag-region><span className="brand">{title}</span><div className="win-actions">
-      <button type="button" onClick={() => setModelIdx((i) => (i + 1) % Math.max(modelsCatalog.length, 1))} title="Change character">◈</button>
+      <button type="button" onClick={nextCharacter} title="Change character">◈</button>
       <button type="button" onClick={() => void toggleCompact()} title="Toggle companion view">{compact ? "▣" : "▬"}</button>
       <button type="button" onClick={() => setSettingsOpen(true)} title="Settings">⚙</button>
       <button type="button" onClick={() => void getCurrentWindow().minimize()} title="Minimize">–</button>
-      <button type="button" onClick={() => void getCurrentWindow().close()} title="Close">×</button>
+      <button type="button" onClick={() => void getCurrentWindow().hide()} title="Hide to tray (Quit from the tray icon)">×</button>
     </div></header>
-    <div className="companion-click-target" onClick={() => compact && setChatOpen(true)} title="Open companion chat">
-      <Companion mood={mood} name={name} compact={compact} modelUrl={modelsCatalog[modelIdx]?.file} flash={flash} roamEnabled />
+    <div className="companion-click-target" onClick={() => { setReactKey((k) => k + 1); bumpActivity(); if (compact) setChatOpen(true); }} title="Open companion chat">
+      <Companion mood={mood} name={name} compact={compact} modelUrl={modelsCatalog[modelIdx]?.file} flash={flash} roamEnabled={roamEnabled} roamPaused={roamPaused} reactKey={reactKey} />
     </div>
     {!compact && <StatusBar connection={connection} connectionMessage={connectionMessage} mood={mood} listening={voice.listening} speaking={voice.speaking} busy={chat.busy} wakeArmed={voice.wakeArmed} interim={voice.interim} />}
     {(!compact || chatOpen) && <div className={compact ? "compact-chat" : "full-chat"}>
       {compact && <button type="button" className="chat-close" onClick={() => setChatOpen(false)}>×</button>}
-      <ChatPanel messages={chat.messages} busy={chat.busy} listening={voice.listening} interim={voice.interim || (voice.wakeArmed ? "Say hey…" : "")} input={input} onInput={setInput} onSend={sendTyped} onMic={() => (voice.listening ? voice.stopListen() : (voice.stopSpeak(), voice.startListen()))} onStopSpeak={() => { voice.stopSpeak(); touchMood("idle"); }} speaking={voice.speaking} sttAvailable={voice.sttAvailable} companionName={name} />
+      <ChatPanel messages={chat.messages} busy={chat.busy} listening={voice.listening} interim={voice.interim || (voice.wakeArmed ? "Say hey…" : "")} input={input} onInput={setInput} onSend={sendTyped} onMic={() => (voice.listening ? voice.stopListen() : voice.startListen())} onStopSpeak={() => { voice.stopSpeak(); touchMood("idle"); }} speaking={voice.speaking} sttAvailable={voice.sttAvailable} companionName={name} />
     </div>}
-    {compact && !chatOpen && <div className="compact-mic"><span className="wake-hint">{wakeHint}</span><button type="button" className={voice.listening ? "hot" : voice.wakeArmed ? "armed" : ""} onClick={() => (voice.listening ? voice.stopListen() : voice.startListen())}>{voice.listening ? "Listening…" : voice.wakeArmed ? "Say hey…" : "Tap to talk"}</button></div>}
+    {compact && !chatOpen && <div className={`compact-mic ${micActive ? "active" : ""}`}>
+      <span className="wake-hint">{wakeHint}</span>
+      <button
+        type="button"
+        className={voice.listening ? "hot" : voice.wakeArmed ? "armed" : ""}
+        onClick={() => (voice.listening ? voice.stopListen() : voice.speaking ? voice.stopSpeak() : voice.startListen())}
+      >
+        {voice.listening ? "Listening… (tap to stop)" : voice.speaking ? "Stop" : "Tap to talk"}
+      </button>
+    </div>}
     {voice.error && <p className="banner">{voice.error}</p>}{chat.error && <p className="banner">{chat.error}</p>}
-    {settingsOpen && settings && <SettingsPanel settings={settings} models={models} onClose={() => setSettingsOpen(false)} onSaved={(s) => { setSettings(s); void refreshConnection(); }} />}
+    {voice.wakeStatus && (!compact || hovered) && <p className="banner subtle">{voice.wakeStatus}</p>}
+    {settingsOpen && settings && <SettingsPanel
+      settings={settings}
+      models={models}
+      chatCount={chat.messages.length}
+      onClearChat={() => chat.clear()}
+      onClose={() => setSettingsOpen(false)}
+      onSaved={(s) => {
+        setSettings(s);
+        void getCurrentWindow().setAlwaysOnTop(compact || s.alwaysOnTop).catch(() => undefined);
+        void refreshConnection();
+      }}
+    />}
   </div>;
 }
 

@@ -38,6 +38,9 @@ export interface PublicSettings {
   brainProvider: BrainProvider | string;
   voiceTarget: string;
   characterModel: string;
+  autostart: boolean;
+  roamEnabled: boolean;
+  wakeWordEnabled: boolean;
 }
 
 export interface SettingsPayload {
@@ -53,6 +56,9 @@ export interface SettingsPayload {
   brainProvider: BrainProvider | string;
   voiceTarget: string;
   characterModel: string;
+  autostart: boolean;
+  roamEnabled: boolean;
+  wakeWordEnabled: boolean;
 }
 
 export interface ConnectionStatus {
