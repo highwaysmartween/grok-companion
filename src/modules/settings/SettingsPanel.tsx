@@ -4,7 +4,14 @@ import { isEnabled as autostartIsEnabled } from "@tauri-apps/plugin-autostart";
 import type { MemoryFact, PublicSettings } from "../../types";
 import { clearApiKey, saveApiKey, saveSettings } from "./settingsApi";
 import { deleteMemory, listMemories } from "../memory/memoryApi";
+import { normalizeRoamAmount } from "../pet/behaviour";
 import "./SettingsPanel.css";
+
+const ROAM_AMOUNTS = [
+  { id: "off", label: "Off — stays put" },
+  { id: "calm", label: "Calm — the odd short stroll (default)" },
+  { id: "lively", label: "Lively — strolls more often" },
+];
 
 const VOICES = [
   { id: "en-HK-YanNeural", label: "Yan (HK English) — default" },
@@ -47,7 +54,7 @@ export function SettingsPanel({ settings, models, onClose, onSaved, onClearChat,
   const [brainProvider, setBrainProvider] = useState(settings.brainProvider || "grok-cli");
   const [voiceTarget, setVoiceTarget] = useState(settings.voiceTarget || "en-HK-YanNeural");
   const [autostart, setAutostart] = useState(settings.autostart);
-  const [roamEnabled, setRoamEnabled] = useState(settings.roamEnabled);
+  const [roamAmount, setRoamAmount] = useState(normalizeRoamAmount(settings.roamAmount));
   const [wakeWordEnabled, setWakeWordEnabled] = useState(settings.wakeWordEnabled);
   const [autostartOs, setAutostartOs] = useState<boolean | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
@@ -79,7 +86,10 @@ export function SettingsPanel({ settings, models, onClose, onSaved, onClearChat,
         voiceTarget: voiceTarget || "en-HK-YanNeural",
         characterModel: settings.characterModel || "",
         autostart,
-        roamEnabled,
+        // Picking a (new) amount un-pauses tray "Pause roaming"; otherwise keep it.
+        roamEnabled:
+          roamAmount !== "off" && roamAmount !== normalizeRoamAmount(settings.roamAmount) ? true : settings.roamEnabled,
+        roamAmount,
         wakeWordEnabled,
       });
       autostartIsEnabled().then(setAutostartOs).catch(() => undefined);
@@ -109,7 +119,9 @@ export function SettingsPanel({ settings, models, onClose, onSaved, onClearChat,
     }
   };
 
-  const uniqueModels = Array.from(new Set([...models, settings.model, "grok-4.6", "grok-4.5", "grok-4.3"]));
+  const uniqueModels = Array.from(
+    new Set([...models, settings.model, "grok-4.7", "grok-4.6", "grok-4.5"].filter((m) => m && m !== "default")),
+  );
 
   return (
     <div className="settings-backdrop" role="dialog" aria-label="Settings">
@@ -152,7 +164,8 @@ export function SettingsPanel({ settings, models, onClose, onSaved, onClearChat,
 
         <label>
           Model
-          <select value={model} onChange={(e) => setModel(e.target.value)}>
+          <select value={model === "default" ? "" : model} onChange={(e) => setModel(e.target.value)}>
+            <option value="">Default ({brainProvider === "xai-api" ? "API default" : "CLI's own default"})</option>
             {uniqueModels.map((m) => (
               <option key={m} value={m}>
                 {m}
@@ -222,14 +235,23 @@ export function SettingsPanel({ settings, models, onClose, onSaved, onClearChat,
             “Hey” wake word
           </label>
           <label className="check">
-            <input type="checkbox" checked={roamEnabled} onChange={(e) => setRoamEnabled(e.target.checked)} />
-            Roam the desktop
-          </label>
-          <label className="check">
             <input type="checkbox" checked={autostart} onChange={(e) => setAutostart(e.target.checked)} />
             Launch with Windows
           </label>
         </div>
+        <label>
+          Roam amount
+          <select value={roamAmount} onChange={(e) => setRoamAmount(normalizeRoamAmount(e.target.value))}>
+            {ROAM_AMOUNTS.map((r) => (
+              <option key={r.id} value={r.id}>
+                {r.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        {!settings.roamEnabled && roamAmount !== "off" && (
+          <p className="fine">Roaming is paused from the tray menu (choosing a different amount here un-pauses it).</p>
+        )}
         {autostartOs !== null && autostartOs !== autostart && (
           <p className="fine">
             Launch-at-login is currently {autostartOs ? "on" : "off"} in Windows; Save to apply (dev builds never register).

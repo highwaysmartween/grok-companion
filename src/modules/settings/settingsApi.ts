@@ -34,6 +34,7 @@ export function toPayload(s: PublicSettings, patch: Partial<SettingsPayload> = {
     characterModel: s.characterModel || "",
     autostart: s.autostart,
     roamEnabled: s.roamEnabled,
+    roamAmount: s.roamAmount || "calm",
     wakeWordEnabled: s.wakeWordEnabled,
     ...patch,
   };

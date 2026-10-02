@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { Companion, snapToFloor } from "./modules/pet/Companion";
+import { normalizeRoamAmount } from "./modules/pet/behaviour";
 import { ChatPanel } from "./modules/chat/ChatPanel";
 import { SettingsPanel } from "./modules/settings/SettingsPanel";
 import { StatusBar } from "./modules/status/StatusBar";
@@ -225,7 +226,11 @@ export default function App() {
     const add = (p: Promise<() => void>) =>
       p.then((fn) => (disposed ? fn() : offs.push(fn))).catch(() => undefined);
     add(listen("tray-open-settings", () => setSettingsOpen(true)));
-    add(listen<boolean>("tray-roam", (e) => setSettings((s) => (s ? { ...s, roamEnabled: !!e.payload } : s))));
+    add(listen<boolean>("tray-roam", (e) => setSettings((s) => {
+      if (!s) return s;
+      const on = !!e.payload;
+      return { ...s, roamEnabled: on, roamAmount: on && s.roamAmount === "off" ? "calm" : s.roamAmount };
+    })));
     return () => {
       disposed = true;
       offs.forEach((fn) => fn());
@@ -247,7 +252,8 @@ export default function App() {
   };
   const sendTyped = () => { const text = input.trim(); if (!text) return; setInput(""); void handleUserText(text); };
   const wakeHint = voice.listening ? voice.interim || "Listening…" : voice.wakeArmed ? "Say “hey”…" : voice.speaking ? "Speaking…" : null;
-  const roamEnabled = settings ? settings.roamEnabled !== false : false;
+  // Tray "Pause roaming" clears roamEnabled; the amount itself is kept.
+  const roamAmount = settings && settings.roamEnabled !== false ? normalizeRoamAmount(settings.roamAmount) : "off";
   const roamPaused = !compact || chatOpen || settingsOpen || hovered;
   const micActive = voice.listening || voice.speaking;
 
@@ -266,7 +272,7 @@ export default function App() {
       <button type="button" onClick={() => void getCurrentWindow().hide()} title="Hide to tray (Quit from the tray icon)">×</button>
     </div></header>
     <div className="companion-click-target" onClick={() => { setReactKey((k) => k + 1); bumpActivity(); if (compact) setChatOpen(true); }} title="Open companion chat">
-      <Companion mood={mood} name={name} compact={compact} modelUrl={modelsCatalog[modelIdx]?.file} flash={flash} roamEnabled={roamEnabled} roamPaused={roamPaused} reactKey={reactKey} />
+      <Companion mood={mood} name={name} compact={compact} modelUrl={modelsCatalog[modelIdx]?.file} flash={flash} roamAmount={roamAmount} roamPaused={roamPaused} reactKey={reactKey} />
     </div>
     {!compact && <StatusBar connection={connection} connectionMessage={connectionMessage} mood={mood} listening={voice.listening} speaking={voice.speaking} busy={chat.busy} wakeArmed={voice.wakeArmed} interim={voice.interim} />}
     {(!compact || chatOpen) && <div className={compact ? "compact-chat" : "full-chat"}>

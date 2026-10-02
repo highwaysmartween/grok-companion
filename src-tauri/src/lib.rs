@@ -110,7 +110,13 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
             "toggle" => toggle_main(app),
             "pause_roam" => {
                 let paused = pause_for_events.is_checked().unwrap_or(false);
-                let _ = settings::update_settings(app, |s| s.roam_enabled = !paused);
+                let _ = settings::update_settings(app, |s| {
+                    s.roam_enabled = !paused;
+                    // Un-pausing with the amount set to Off would do nothing visible.
+                    if !paused && s.roam_amount == "off" {
+                        s.roam_amount = settings::DEFAULT_ROAM_AMOUNT.to_string();
+                    }
+                });
                 let _ = app.emit("tray-roam", !paused);
             }
             "settings" => {

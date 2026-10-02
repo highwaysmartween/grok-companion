@@ -11,7 +11,14 @@ const KEY_SETTINGS: &str = "settings";
 
 /// Bump when a default changes in a way existing installs should pick up once.
 /// rev 2 (v1.1.1): desktop pet defaults — always on top + launch with Windows.
-const SETTINGS_REV: u32 = 2;
+/// rev 3 (v1.1.1): roam amount (Off / Calm / Lively) → Calm; CLI model "grok-4.6"
+///   (the old built-in default the CLI no longer knows) → "" = CLI's own default.
+const SETTINGS_REV: u32 = 3;
+
+pub const ROAM_AMOUNTS: [&str; 3] = ["off", "calm", "lively"];
+pub const DEFAULT_ROAM_AMOUNT: &str = "calm";
+/// Built-in model default from v1.1.0/v1.1.1-pre; rejected by current CLIs.
+const LEGACY_DEFAULT_MODEL: &str = "grok-4.6";
 
 pub const DEFAULT_VOICE: &str = "en-HK-YanNeural";
 
@@ -41,8 +48,10 @@ pub struct AppSettings {
     pub character_model: String,
     /// Launch with Windows (tauri-plugin-autostart).
     pub autostart: bool,
-    /// Let her walk around the desktop.
+    /// Roaming not paused (tray "Pause roaming" clears this).
     pub roam_enabled: bool,
+    /// How much she wanders: "off" | "calm" | "lively".
+    pub roam_amount: String,
     /// Background "hey" wake-word listener.
     pub wake_word_enabled: bool,
     /// Field-level default (0) so stores written before v1.1.1 get migrated once.
@@ -53,7 +62,9 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            model: crate::grok::DEFAULT_MODEL.to_string(),
+            // Empty = let the Grok CLI use its own default model (API mode falls
+            // back to grok::DEFAULT_MODEL at request time).
+            model: String::new(),
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             personality: String::from("chill"),
             companion_name: String::from("Nova"),
@@ -67,6 +78,7 @@ impl Default for AppSettings {
             character_model: String::new(),
             autostart: true,
             roam_enabled: true,
+            roam_amount: DEFAULT_ROAM_AMOUNT.to_string(),
             wake_word_enabled: true,
             settings_rev: SETTINGS_REV,
         }
@@ -79,6 +91,25 @@ impl AppSettings {
         if self.settings_rev < 2 {
             self.always_on_top = true;
             self.autostart = true;
+        }
+        if self.settings_rev < 3 {
+            // v1.1.1 movement rework: everyone starts on the calm profile.
+            self.roam_amount = DEFAULT_ROAM_AMOUNT.to_string();
+            self.roam_enabled = true;
+            if self.model.trim() == LEGACY_DEFAULT_MODEL
+                && crate::grok::is_cli_provider_name(&self.brain_provider)
+            {
+                self.model = String::new();
+            }
+        }
+        let amount = self.roam_amount.trim().to_lowercase();
+        self.roam_amount = if ROAM_AMOUNTS.contains(&amount.as_str()) {
+            amount
+        } else {
+            DEFAULT_ROAM_AMOUNT.to_string()
+        };
+        if self.model.trim().eq_ignore_ascii_case("default") {
+            self.model = String::new();
         }
         if self.voice_target.trim().is_empty() {
             self.voice_target = DEFAULT_VOICE.to_string();
@@ -114,6 +145,7 @@ pub struct PublicSettings {
     pub character_model: String,
     pub autostart: bool,
     pub roam_enabled: bool,
+    pub roam_amount: String,
     pub wake_word_enabled: bool,
 }
 
@@ -142,6 +174,7 @@ impl PublicSettings {
             character_model: settings.character_model,
             autostart: settings.autostart,
             roam_enabled: settings.roam_enabled,
+            roam_amount: settings.roam_amount,
             wake_word_enabled: settings.wake_word_enabled,
         }
     }
@@ -284,5 +317,46 @@ mod tests {
         assert!(s.autostart);
         assert_eq!(s.model, "grok-4");
         assert_eq!(s.voice_target, super::DEFAULT_VOICE);
+        assert_eq!(s.roam_amount, "calm");
+    }
+
+    #[test]
+    fn rev2_settings_migrate_roam_and_keep_explicit_model() {
+        let rev2 = serde_json::json!({
+            "model": "grok-4.7",
+            "brainProvider": "grok-cli",
+            "roamEnabled": false,
+            "settingsRev": 2
+        });
+        let s: AppSettings = serde_json::from_value(rev2).unwrap();
+        let s = s.migrate();
+        assert_eq!(s.model, "grok-4.7");
+        assert_eq!(s.roam_amount, "calm");
+        assert!(s.roam_enabled);
+        assert_eq!(s.settings_rev, super::SETTINGS_REV);
+    }
+
+    #[test]
+    fn legacy_cli_default_model_becomes_cli_default() {
+        let rev2 = serde_json::json!({ "model": "grok-4.6", "brainProvider": "grok-cli", "settingsRev": 2 });
+        let s: AppSettings = serde_json::from_value(rev2).unwrap();
+        assert_eq!(s.migrate().model, "");
+        // API users keep whatever they picked.
+        let api = serde_json::json!({ "model": "grok-4.6", "brainProvider": "xai-api", "settingsRev": 2 });
+        let s: AppSettings = serde_json::from_value(api).unwrap();
+        assert_eq!(s.migrate().model, "grok-4.6");
+    }
+
+    #[test]
+    fn new_settings_default_to_cli_default_model_and_calm() {
+        let s = AppSettings::default();
+        assert_eq!(s.model, "");
+        assert_eq!(s.roam_amount, "calm");
+        let mut bad = AppSettings::default();
+        bad.roam_amount = "possessed".into();
+        bad.model = "default".into();
+        let bad = bad.migrate();
+        assert_eq!(bad.roam_amount, "calm");
+        assert_eq!(bad.model, "");
     }
 }

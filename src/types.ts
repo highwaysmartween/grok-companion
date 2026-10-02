@@ -40,6 +40,8 @@ export interface PublicSettings {
   characterModel: string;
   autostart: boolean;
   roamEnabled: boolean;
+  /** "off" | "calm" | "lively" */
+  roamAmount: string;
   wakeWordEnabled: boolean;
 }
 
@@ -58,6 +60,8 @@ export interface SettingsPayload {
   characterModel: string;
   autostart: boolean;
   roamEnabled: boolean;
+  /** "off" | "calm" | "lively" */
+  roamAmount: string;
   wakeWordEnabled: boolean;
 }
 

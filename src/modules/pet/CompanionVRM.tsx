@@ -7,13 +7,25 @@ import type { VRM, VRMHumanBoneName } from "@pixiv/three-vrm";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { PetMood } from "../../types";
-import { loadMixamoAnimation } from "./loadMixamoAnimation";
-
-/** Host ↔ pet walk contract: host writes the real direction (±1) once it knows
- *  the window can move, or 0 to end/abort the walk. `null` = pending. */
-export interface RoamControl {
-  facing: 1 | -1 | 0 | null;
-}
+import { clipRootSpeed, loadMixamoAnimation } from "./loadMixamoAnimation";
+import {
+  ROAM_PROFILES,
+  STROLL_TIMING,
+  Tween,
+  activityDuration,
+  makeStrollMotion,
+  pickActivity,
+  planStroll,
+  rand,
+  randIn,
+  shouldChainStroll,
+  solveGait,
+  type ActivityId,
+  type ClipKey,
+  type RoamAmount,
+  type RoamDriver,
+  type StrollMotion,
+} from "./behaviour";
 
 interface Props {
   mood: PetMood;
@@ -21,17 +33,14 @@ interface Props {
   modelUrl?: string;
   /** When true, hide CLOTH materials so the nude/lingerie body shows. */
   flash?: boolean;
-  /** Allow the wander behaviour (walk + window move). */
-  roamEnabled?: boolean;
+  /** How much she wanders. "off" = never walks (idle / look / turn still run). */
+  roamAmount?: RoamAmount;
+  /** Strolls allowed right now (not paused by hover / chat / tray). */
+  roamAllowed?: boolean;
   /** Bump to trigger a one-shot reaction (wave / nod). */
   reactKey?: number;
-  /**
-   * Fired when a roam walk segment starts/ends so the host can move the
-   * transparent Tauri window across the desktop.
-   */
-  onWalkStart?: (opts: { facing: 1 | -1; durationMs: number }) => void;
-  onWalkEnd?: () => void;
-  roamControl?: MutableRefObject<RoamControl>;
+  /** Host that moves the transparent Tauri window during a stroll. */
+  roamDriver?: MutableRefObject<RoamDriver | null>;
 }
 
 /**
@@ -39,7 +48,7 @@ interface Props {
  * picked up automatically if dropped into public/animations/ later. Missing clips
  * fall back to procedural motion (look-at, breathing, nods, sleep pose).
  */
-const ANIM = {
+const ANIM: Record<ClipKey, readonly string[]> = {
   idle: ["/animations/Happy_Idle.fbx", "/animations/Idle.fbx"],
   look: ["/animations/Looking_Around.fbx"],
   walk: ["/animations/Walking.fbx"],
@@ -48,12 +57,38 @@ const ANIM = {
   think: ["/animations/Thinking.fbx"],
   sit: ["/animations/Sitting.fbx"],
   sleep: ["/animations/Sleeping.fbx"],
-} as const;
+  stretch: ["/animations/Stretch.fbx", "/animations/Stretching.fbx"],
+  jump: ["/animations/Jump.fbx"],
+  pounce: ["/animations/Pounce.fbx"],
+};
+/** Clips that play once (everything else loops). */
+const ONE_SHOT: ReadonlySet<ClipKey> = new Set<ClipKey>(["wave", "stretch", "jump", "pounce"]);
+/** Clips whose root motion is pinned so the window (not the clip) carries her. */
+const IN_PLACE: ReadonlySet<ClipKey> = new Set<ClipKey>(["walk", "jump", "pounce"]);
 
-export const PET_VRM_VERSION = 17;
+export const PET_VRM_VERSION = 18;
 
-type ClipKey = keyof typeof ANIM;
-type Behaviour = "idle" | "wander" | "look" | "react" | "sleep";
+/** Reactive modes override the self-directed activity loop (see behaviour.ts). */
+type Mode = "activity" | "attend" | "react" | "sleep";
+type StrollPhase = "measure" | "turn" | "prePause" | "walk" | "stopping" | "postPause" | "turnBack";
+interface Stroll {
+  phase: StrollPhase;
+  phaseAt: number;
+  phaseUntil: number;
+  dir: 1 | -1;
+  motion: StrollMotion | null;
+  yaw: number;
+  /** Walk-clip timeScale at profile cruise speed (feet planted). */
+  timeScale: number;
+  cruise: number;
+  pos: number;
+  vel: number;
+  stopFromVel: number;
+  interrupted: boolean;
+  /** Driver.begin() resolved after we gave up → release on arrival. */
+  dropped: boolean;
+  fadedOut: boolean;
+}
 
 /** Lightweight rendering for Iris Xe-class GPUs. */
 const TARGET_FPS = 30;
@@ -113,10 +148,10 @@ function setClothVisible(root: THREE.Object3D, visible: boolean) {
   });
 }
 
-async function tryLoadClip(urls: readonly string[], vrm: VRM): Promise<THREE.AnimationClip | null> {
+async function tryLoadClip(urls: readonly string[], vrm: VRM, inPlace: boolean): Promise<THREE.AnimationClip | null> {
   for (const url of urls) {
     try {
-      return await loadMixamoAnimation(url, vrm);
+      return await loadMixamoAnimation(url, vrm, { inPlace });
     } catch {
       // Missing / not-a-Mixamo file → next candidate, then procedural fallback.
     }
@@ -176,7 +211,8 @@ type CursorSample = { x: number; y: number; width: number; height: number; insid
 
 /**
  * VRM + Mixamo clips + procedural life layer:
- *  - behaviour state machine (idle / wander / look-at-user / react / sleep)
+ *  - behaviour: reactive modes (attend / react / sleep) over a calm activity
+ *    loop (idle / look-around / turn / stroll …) defined in behaviour.ts
  *  - head/neck/chest look-at that follows the global cursor
  *  - breathing + weight shift, mood → expressions, talking mouth
  * Clean neutral lighting: NoToneMapping + white lights (no ACES, no warm/cheek/rim hacks).
@@ -186,30 +222,27 @@ export function CompanionVRM({
   className,
   modelUrl = "/models/companion.vrm",
   flash = false,
-  roamEnabled = true,
+  roamAmount = "calm",
+  roamAllowed = true,
   reactKey = 0,
-  onWalkStart,
-  onWalkEnd,
-  roamControl,
+  roamDriver,
 }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
   const moodRef = useRef(mood);
   const flashRef = useRef(flash);
-  const roamEnabledRef = useRef(roamEnabled);
+  const roamAmountRef = useRef(roamAmount);
+  const roamAllowedRef = useRef(roamAllowed);
   const reactKeyRef = useRef(reactKey);
   const vrmRef = useRef<VRM | null>(null);
-  const onWalkStartRef = useRef(onWalkStart);
-  const onWalkEndRef = useRef(onWalkEnd);
-  const roamControlRef = useRef(roamControl);
+  const roamDriverRef = useRef(roamDriver);
   const prevFlashRef = useRef(false); // false so mount-with-flash (r18 switch) still fires gesture
   const flashGestureRef = useRef(false);
   moodRef.current = mood;
   flashRef.current = flash;
-  roamEnabledRef.current = roamEnabled;
+  roamAmountRef.current = roamAmount;
+  roamAllowedRef.current = roamAllowed;
   reactKeyRef.current = reactKey;
-  onWalkStartRef.current = onWalkStart;
-  onWalkEndRef.current = onWalkEnd;
-  roamControlRef.current = roamControl;
+  roamDriverRef.current = roamDriver;
 
   useEffect(() => {
     const v = vrmRef.current;
@@ -267,14 +300,25 @@ export function CompanionVRM({
     let paused = false;
     let mirror = 1; // VRM0 normalized rig: x/z rotations flip sign
     const available = new Set<string>();
+    const loadedClips = new Set<ClipKey>();
+    /** Walking.fbx root travel before pinning (VRM m/s); drives foot-locking. */
+    let walkRootSpeed = 0;
 
     // --- behaviour state ---------------------------------------------------
     let t = 0;
-    let beh: Behaviour = "idle";
-    let behUntil = 3 + Math.random() * 3;
-    let idleVariant: "plain" | "look" = "plain";
-    let facing: 1 | -1 = 1;
-    let walkNotified = false;
+    let mode: Mode = "activity";
+    let modeUntil = 0;
+    let activity: ActivityId = "idle";
+    let actUntil = rand(8, 14);
+    let turnBackAt = 0;
+    let strollsInRow = 0;
+    let forceStrollNext = false;
+    let stroll: Stroll | null = null;
+    /** Body yaw from deliberate turns (stroll heading, turn-in-place). */
+    const bodyTurn = new Tween();
+    let driftYaw = 0;
+    let modelHeight = 1.5;
+    const camTarget = new THREE.Vector3(0, 0.95, 0);
     let reactFrom = -10;
     let lastReactKey = reactKeyRef.current;
     let lastMood: PetMood = moodRef.current;
@@ -285,7 +329,6 @@ export function CompanionVRM({
     // smoothed procedural look
     let lookYaw = 0;
     let lookPitch = 0;
-    let bodyYaw = 0;
     let sleepBlend = 0;
 
     const cursor: CursorSample = { x: 0, y: 0, width: 1, height: 1, inside: false, movedAt: -1e9 };
@@ -332,17 +375,9 @@ export function CompanionVRM({
       return true;
     };
 
-    const endWalk = () => {
-      if (walkNotified) {
-        walkNotified = false;
-        onWalkEndRef.current?.();
-      }
-    };
-
-    const enter = (next: Behaviour, duration: number) => {
-      if (beh === "wander" && next !== "wander") endWalk();
-      beh = next;
-      behUntil = t + duration;
+    const enterMode = (next: Mode, duration: number) => {
+      mode = next;
+      modeUntil = t + duration;
     };
 
     // --- cursor polling (global cursor via Rust; DOM fallback in browser preview) ---
@@ -376,7 +411,7 @@ export function CompanionVRM({
         }
       }
       if (disposed) return;
-      cursorTimer = window.setTimeout(() => void pollCursor(), beh === "sleep" ? CURSOR_POLL_SLEEP_MS : CURSOR_POLL_MS);
+      cursorTimer = window.setTimeout(() => void pollCursor(), mode === "sleep" ? CURSOR_POLL_SLEEP_MS : CURSOR_POLL_MS);
     };
     void pollCursor();
 
@@ -434,8 +469,10 @@ export function CompanionVRM({
         loaded.scene.position.y -= box.min.y;
 
         const h = Math.max(size.y, 1.2);
+        modelHeight = h;
         camera.position.set(0, h * 0.58, h * 2.05);
-        camera.lookAt(0, h * 0.48, 0);
+        camTarget.set(0, h * 0.48, 0);
+        camera.lookAt(camTarget);
         camera.updateProjectionMatrix();
 
         root.add(loaded.scene);
@@ -450,15 +487,17 @@ export function CompanionVRM({
         }
 
         const keys = Object.keys(ANIM) as ClipKey[];
-        const clips = await Promise.all(keys.map((k) => tryLoadClip(ANIM[k], loaded)));
+        const clips = await Promise.all(keys.map((k) => tryLoadClip(ANIM[k], loaded, IN_PLACE.has(k))));
         if (disposed || !mixer) return;
         keys.forEach((k, i) => {
           const clip = clips[i];
           if (!clip || !mixer) return;
           const a = mixer.clipAction(clip);
-          const loop = k !== "wave";
+          const loop = !ONE_SHOT.has(k);
           a.setLoop(loop ? THREE.LoopRepeat : THREE.LoopOnce, loop ? Infinity : 1);
+          if (k === "walk") walkRootSpeed = clipRootSpeed(clip);
           actions[k] = a;
+          loadedClips.add(k);
         });
 
         if (actions.idle) crossfade("idle", 0.01);
@@ -487,16 +526,283 @@ export function CompanionVRM({
       if (available.has(n)) vrm?.expressionManager?.setValue(n, v);
     };
 
-    // --- behaviour state machine (runs on its own clock, independent of React) ---
-    const updateBehaviour = () => {
+    // --- behaviour (runs on its own clock, independent of React) ------------
+
+    /** Walk clip's sideways foot speed on screen at timeScale 1 (logical px/s). */
+    const naturalWalkPx = () => {
+      const fovRad = (camera.fov * Math.PI) / 180;
+      const dist = camera.position.distanceTo(camTarget);
+      const pxPerMetre = (el.clientHeight || 580) / (2 * dist * Math.tan(fovRad / 2));
+      // Mixamo Walking ≈ 1.1 body-heights/s if the clip had no measurable root motion.
+      const mps = walkRootSpeed > 0 ? walkRootSpeed : modelHeight * 1.1;
+      return mps * pxPerMetre;
+    };
+
+    const startIdle = (dwell: number) => {
+      activity = "idle";
+      actUntil = t + dwell;
+      if (current !== "idle" && current !== "wave") crossfade("idle", 0.6);
+      if (Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 0.6);
+    };
+
+    const fullIdle = () => {
+      strollsInRow = 0;
+      startIdle(randIn(ROAM_PROFILES[roamAmountRef.current].idleDwell));
+    };
+
+    const strollInterrupted = () => {
+      const m = moodRef.current;
+      const emotional = m === "happy" || m === "annoyed" || m === "sad" || m === "confused" || m === "error";
+      return (
+        m === "speaking" ||
+        m === "listening" ||
+        m === "thinking" ||
+        m === "sleeping" ||
+        !roamAllowedRef.current ||
+        roamAmountRef.current === "off" ||
+        flashGestureRef.current ||
+        reactKeyRef.current !== lastReactKey ||
+        (m !== lastMood && emotional)
+      );
+    };
+
+    const beginStroll = () => {
+      const driver = roamDriverRef.current?.current;
+      if (!driver || !actions.walk) return false;
+      const s: Stroll = {
+        phase: "measure",
+        phaseAt: t,
+        phaseUntil: t + 3,
+        dir: 1,
+        motion: null,
+        yaw: 0,
+        timeScale: 0.6,
+        cruise: 0,
+        pos: 0,
+        vel: 0,
+        stopFromVel: 0,
+        interrupted: false,
+        dropped: false,
+        fadedOut: false,
+      };
+      stroll = s;
+      activity = "stroll";
+      void driver.begin().then(
+        (room) => {
+          if (s.dropped || disposed || stroll !== s) {
+            if (room) driver.end();
+            return;
+          }
+          const amount = roamAmountRef.current;
+          const plan = room && !s.interrupted ? planStroll(amount, room) : null;
+          if (!plan) {
+            if (room) driver.end();
+            stroll = null;
+            fullIdle();
+            return;
+          }
+          const prof = ROAM_PROFILES[amount];
+          const gait = solveGait(prof.cruiseSpeed, naturalWalkPx(), prof.targetTimeScale);
+          s.dir = plan.dir;
+          s.motion = makeStrollMotion(plan.distance, prof.cruiseSpeed, prof.rampTime);
+          s.cruise = prof.cruiseSpeed;
+          s.yaw = gait.yaw;
+          s.timeScale = gait.timeScale;
+          s.phase = "turn";
+          s.phaseAt = t;
+          bodyTurn.set(s.dir * s.yaw, t, STROLL_TIMING.turn);
+        },
+        () => {
+          if (stroll === s) {
+            stroll = null;
+            fullIdle();
+          }
+        },
+      );
+      return true;
+    };
+
+    const setWalkRate = (s: Stroll, vel: number) => {
+      const a = actions.walk;
+      if (!a) return;
+      // Feet planted: clip rate tracks actual speed through the ease-in/out.
+      a.timeScale = Math.max(0.12, s.timeScale * (vel / Math.max(1, s.cruise)));
+    };
+
+    const finishStroll = (s: Stroll) => {
+      stroll = null;
+      strollsInRow += 1;
+      if (!s.interrupted && shouldChainStroll(roamAmountRef.current, strollsInRow)) {
+        forceStrollNext = true;
+        startIdle(randIn(ROAM_PROFILES[roamAmountRef.current].chainDwell));
+      } else {
+        fullIdle();
+      }
+    };
+
+    /** Advance the stroll choreography: turn → beat → walk → beat → turn back. */
+    const advanceStroll = (s: Stroll, dt: number) => {
+      const driver = roamDriverRef.current?.current ?? null;
+      if (!s.interrupted && strollInterrupted()) {
+        s.interrupted = true;
+        if (s.phase === "measure") {
+          s.dropped = true;
+          stroll = null;
+          fullIdle();
+          return;
+        }
+        if (s.phase === "turn" || s.phase === "prePause") {
+          s.phase = "turnBack";
+          s.phaseAt = t;
+          bodyTurn.set(0, t, STROLL_TIMING.turn);
+        } else if (s.phase === "walk") {
+          s.phase = "stopping";
+          s.phaseAt = t;
+          s.stopFromVel = s.vel;
+        } else if (s.phase === "postPause") {
+          s.phaseUntil = t;
+        }
+      }
+      switch (s.phase) {
+        case "measure":
+          if (t > s.phaseUntil) {
+            s.dropped = true;
+            stroll = null;
+            fullIdle();
+          }
+          return;
+        case "turn":
+          if (bodyTurn.done(t)) {
+            s.phase = "prePause";
+            s.phaseAt = t;
+            s.phaseUntil = t + randIn(STROLL_TIMING.prePause);
+          }
+          return;
+        case "prePause":
+          if (t >= s.phaseUntil && s.motion) {
+            s.phase = "walk";
+            s.phaseAt = t;
+            setWalkRate(s, 0);
+            crossfade("walk", STROLL_TIMING.crossfade);
+          }
+          return;
+        case "walk": {
+          const m = s.motion!;
+          const el2 = t - s.phaseAt;
+          const smp = m.sample(el2);
+          s.pos = smp.pos;
+          s.vel = smp.vel;
+          driver?.moveTo(s.dir * s.pos);
+          setWalkRate(s, s.vel);
+          if (!s.fadedOut && m.duration - el2 <= STROLL_TIMING.crossfade) {
+            s.fadedOut = true;
+            crossfade("idle", STROLL_TIMING.crossfade);
+          }
+          if (el2 >= m.duration) {
+            driver?.end();
+            s.phase = "postPause";
+            s.phaseAt = t;
+            s.phaseUntil = t + randIn(STROLL_TIMING.postPause);
+          }
+          return;
+        }
+        case "stopping": {
+          const u = (t - s.phaseAt) / STROLL_TIMING.abortRamp;
+          s.vel = s.stopFromVel * (1 - Math.min(1, u * u * (3 - 2 * u)));
+          s.pos += s.vel * dt;
+          driver?.moveTo(s.dir * s.pos);
+          setWalkRate(s, s.vel);
+          if (!s.fadedOut) {
+            s.fadedOut = true;
+            crossfade("idle", STROLL_TIMING.abortRamp);
+          }
+          if (u >= 1) {
+            driver?.end();
+            s.phase = "postPause";
+            s.phaseAt = t;
+            s.phaseUntil = t + 0.25;
+          }
+          return;
+        }
+        case "postPause":
+          if (t >= s.phaseUntil) {
+            s.phase = "turnBack";
+            s.phaseAt = t;
+            bodyTurn.set(0, t, STROLL_TIMING.turn);
+          }
+          return;
+        case "turnBack":
+          if (bodyTurn.done(t)) finishStroll(s);
+          return;
+      }
+    };
+
+    const startActivity = (next: ActivityId) => {
+      switch (next) {
+        case "stroll":
+          if (beginStroll()) return;
+          fullIdle();
+          return;
+        case "lookAround":
+          activity = "lookAround";
+          actUntil = t + activityDuration("lookAround");
+          glanceSide *= -1;
+          if (actions.look) crossfade("look", 0.6);
+          return;
+        case "turn": {
+          activity = "turn";
+          const d = activityDuration("turn");
+          actUntil = t + d;
+          turnBackAt = t + d - 0.7;
+          glanceSide *= -1;
+          bodyTurn.set(glanceSide * rand(0.22, 0.4), t, 0.7);
+          return;
+        }
+        case "stretch":
+        case "hop": {
+          const key: ClipKey = next === "stretch" ? "stretch" : actions.pounce && Math.random() < 0.5 ? "pounce" : "jump";
+          const act = actions[key];
+          if (!act || !playOnce(key, "idle")) {
+            fullIdle();
+            return;
+          }
+          activity = next;
+          actUntil = t + act.getClip().duration + 0.4;
+          return;
+        }
+        case "sit":
+          if (!crossfade("sit", 0.8)) {
+            fullIdle();
+            return;
+          }
+          activity = "sit";
+          actUntil = t + activityDuration("sit");
+          return;
+        case "visitIcon":
+          // TODO(visit-icon): run visitDesktopIcon() (behaviour.ts) once icon positions exist.
+          fullIdle();
+          return;
+        default:
+          startIdle(randIn(ROAM_PROFILES[roamAmountRef.current].idleDwell));
+      }
+    };
+
+    const updateBehaviour = (dt: number) => {
       const m = moodRef.current;
       const engaged = m === "speaking" || m === "listening" || m === "thinking";
       const near = cursorNear();
-      const rc = roamControlRef.current?.current;
+
+      // A stroll always finishes gracefully (eases to a stop, turns back) before
+      // anything else takes over — no snapping mid-step.
+      if (stroll) {
+        advanceStroll(stroll, dt);
+        if (stroll) return;
+      }
+      if (activity === "turn" && t >= turnBackAt && Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 0.7);
 
       if (flashGestureRef.current) {
         flashGestureRef.current = false;
-        enter("react", 3.5);
+        enterMode("react", 3.5);
         reactFrom = t;
         if (!playOnce("wave", "idle")) {
           if (!crossfade("talk")) crossfade("idle");
@@ -507,80 +813,80 @@ export function CompanionVRM({
       // Reactions: explicit poke, or an emotional mood change.
       const moodChanged = m !== lastMood;
       const emotional = m === "happy" || m === "annoyed" || m === "sad" || m === "confused" || m === "error";
-      if (reactKeyRef.current !== lastReactKey || (moodChanged && emotional && beh !== "sleep")) {
+      if (reactKeyRef.current !== lastReactKey || (moodChanged && emotional && mode !== "sleep")) {
         lastReactKey = reactKeyRef.current;
         lastMood = m;
-        enter("react", 1.8);
+        enterMode("react", 1.8);
         reactFrom = t;
+        if (Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 0.5);
         if (m === "happy" || !moodChanged) playOnce("wave", "idle");
         return;
       }
       lastMood = m;
 
       if (m === "sleeping" && !engaged) {
-        if (beh !== "sleep") {
-          enter("sleep", 1e9);
+        if (mode !== "sleep") {
+          enterMode("sleep", 1e9);
+          if (Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 1.2);
           if (!crossfade("sleep", 1.2)) if (!crossfade("sit", 1.2)) crossfade("idle", 1.2);
         }
         return;
       }
-      if (beh === "sleep") {
-        // Woke up: a little stretch/nod, then attentive.
-        enter("react", 1.6);
+      if (mode === "sleep") {
+        // Woke up: a little nod, then attentive.
+        enterMode("react", 1.6);
         reactFrom = t;
         crossfade("idle", 0.8);
         return;
       }
 
-      if (beh === "react" && t < behUntil) return;
+      if (mode === "react" && t < modeUntil) return;
 
       if (engaged || near) {
-        if (beh !== "look") enter("look", 2);
-        behUntil = t + 2;
+        if (mode !== "attend") {
+          enterMode("attend", 2);
+          if (Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 0.5);
+        }
+        modeUntil = t + 2;
         const want: ClipKey = m === "speaking" && actions.talk ? "talk" : m === "thinking" && actions.think ? "think" : "idle";
-        if (current !== want && current !== "wave") crossfade(want);
+        if (current !== want && current !== "wave") crossfade(want, 0.5);
         return;
       }
 
-      if (beh === "wander") {
-        if (rc && rc.facing !== null && rc.facing !== 0) facing = rc.facing;
-        const hostEnded = rc ? rc.facing === 0 : false;
-        if (hostEnded || t > behUntil || !roamEnabledRef.current) {
-          enter("idle", 8 + Math.random() * 10);
-          idleVariant = "plain";
-          crossfade("idle");
-        }
+      if (mode !== "activity") {
+        // Back to her own business: settle for a while first.
+        mode = "activity";
+        startIdle(rand(4, 9));
         return;
       }
 
-      if (t > behUntil) {
-        const roll = Math.random();
-        if (roll < 0.45 && roamEnabledRef.current && actions.walk && onWalkStartRef.current) {
-          const durationMs = 3000 + Math.floor(Math.random() * 3000);
-          facing = Math.random() < 0.5 ? 1 : -1;
-          if (rc) rc.facing = null;
-          enter("wander", durationMs / 1000 + 1.5);
-          crossfade("walk");
-          walkNotified = true;
-          onWalkStartRef.current({ facing, durationMs });
-        } else if (roll < 0.7) {
-          enter("idle", 6 + Math.random() * 8);
-          idleVariant = "look";
-          glanceSide *= -1;
-          if (!crossfade("look")) crossfade("idle");
-        } else {
-          enter("idle", 7 + Math.random() * 9);
-          idleVariant = "plain";
-          crossfade("idle");
-        }
+      if (t < actUntil) return;
+
+      // Activity finished → tidy up, then pick the next one.
+      if (activity === "sit" || activity === "lookAround") crossfade("idle", 0.8);
+      if (activity !== "idle") {
+        startIdle(randIn(ROAM_PROFILES[roamAmountRef.current].idleDwell));
+        return;
       }
+      const amount = roamAmountRef.current;
+      const canMove = roamAllowedRef.current && amount !== "off" && !!roamDriverRef.current?.current && !!actions.walk;
+      if (forceStrollNext) {
+        forceStrollNext = false;
+        if (canMove) {
+          startActivity("stroll");
+          return;
+        }
+        strollsInRow = 0;
+      }
+      startActivity(pickActivity({ amount, clips: loadedClips, canMove, strollsInRow }));
     };
 
     const applyProcedural = (dt: number) => {
       if (!vrm) return;
       const m = moodRef.current;
       const engaged = m === "speaking" || m === "listening" || m === "thinking";
-      const sleeping = beh === "sleep";
+      const sleeping = mode === "sleep";
+      const walking = !!stroll && stroll.phase !== "measure";
       sleepBlend = damp(sleepBlend, sleeping ? 1 : 0, 1.5, dt);
 
       // Target look (yaw/pitch, radians) from cursor relative to her head.
@@ -590,17 +896,22 @@ export function CompanionVRM({
       const headY = cursor.height * 0.22;
       const dx = cursor.x - headX;
       const dy = cursor.y - headY;
-      const follow = beh === "look" ? 1 : beh === "wander" || sleeping ? 0 : 0.45;
+      const own = mode === "activity";
+      const follow = mode === "attend" ? 1 : walking || sleeping ? 0 : 0.45;
       if (follow > 0 && t - cursor.movedAt < 8) {
         tYaw = clamp(Math.atan2(dx, 700), -0.75, 0.75) * follow;
         tPitch = clamp(Math.atan2(dy, 900), -0.35, 0.45) * follow;
       }
-      if (beh === "idle" && idleVariant === "look" && !actions.look) {
-        // Procedural look-around when the clip is missing.
-        tYaw += Math.sin(t * 0.5) * 0.45 * glanceSide;
-        tPitch += Math.sin(t * 0.31) * 0.06;
-      } else if (beh === "idle" && follow < 1) {
-        tYaw += Math.sin(t * 0.22) * 0.12 * glanceSide;
+      if (walking && stroll) {
+        // Glance where she's heading (the body is only turned ~3/4).
+        tYaw += stroll.dir * 0.22;
+        tPitch += 0.04;
+      } else if (own && activity === "lookAround" && !actions.look) {
+        // Procedural look-around when the clip is missing (slow, unhurried).
+        tYaw += Math.sin((t - actUntil) * 0.9) * 0.4 * glanceSide;
+        tPitch += Math.sin(t * 0.31) * 0.05;
+      } else if (own && follow < 1) {
+        tYaw += Math.sin(t * 0.22) * 0.1 * glanceSide;
       }
       if (m === "thinking") {
         tYaw += -0.25;
@@ -611,7 +922,7 @@ export function CompanionVRM({
       let nod = 0;
       let tilt = 0;
       const rt = t - reactFrom;
-      if (beh === "react" && rt < 1.8) {
+      if (mode === "react" && rt < 1.8) {
         const env = Math.sin(Math.min(1, rt / 1.8) * Math.PI);
         nod = Math.sin(rt * 9) * 0.08 * env;
         tilt = 0.12 * env * (m === "confused" ? 1.6 : 1);
@@ -619,8 +930,8 @@ export function CompanionVRM({
       if (m === "confused") tilt += 0.1;
       if (m === "listening") tilt += 0.06;
 
-      lookYaw = damp(lookYaw, tYaw, 5, dt);
-      lookPitch = damp(lookPitch, tPitch, 5, dt);
+      lookYaw = damp(lookYaw, tYaw, 3.5, dt);
+      lookPitch = damp(lookPitch, tPitch, 3.5, dt);
 
       // Sleep pose: head down, slow breath.
       const sleepPitch = 0.38 * sleepBlend;
@@ -642,10 +953,10 @@ export function CompanionVRM({
         addRot("rightLowerArm", 0, 0.15, 0);
       }
 
-      // Body turn: face walk direction, else subtly toward the cursor.
-      const walkTurn = beh === "wander" && current === "walk" ? facing * 0.8 : 0;
-      bodyYaw = damp(bodyYaw, walkTurn || lookYaw * 0.25 + Math.sin(t * 0.18) * 0.05, 3, dt);
-      root.rotation.set(0, bodyYaw, 0);
+      // Body turn: eased deliberate turns (stroll heading / turn-in-place) plus
+      // a slow drift toward the cursor when standing.
+      driftYaw = damp(driftYaw, stroll || sleeping ? 0 : lookYaw * 0.2 + Math.sin(t * 0.18) * 0.04, 2, dt);
+      root.rotation.set(0, bodyTurn.update(t) + driftYaw, 0);
 
       // Eyes.
       const headNode = bone("head");
@@ -661,7 +972,7 @@ export function CompanionVRM({
     const applyExpressions = (dt: number) => {
       if (!vrm?.expressionManager) return;
       const m = moodRef.current;
-      const target = moodExpressions(beh === "sleep" ? "sleeping" : m, flashRef.current);
+      const target = moodExpressions(mode === "sleep" ? "sleeping" : m, flashRef.current);
       for (const [n, v] of Object.entries(target)) {
         expr[n] = damp(expr[n] ?? 0, v, 4, dt);
         setExpr(n, expr[n]);
@@ -694,7 +1005,7 @@ export function CompanionVRM({
       t += dt;
 
       if (vrm && mixer) {
-        updateBehaviour();
+        updateBehaviour(dt);
         // Reset procedural bones to rest so clip tracks (or nothing) define the base pose.
         for (const n of PROC_BONES) bone(n)?.quaternion.identity();
         mixer.update(dt);
@@ -746,7 +1057,11 @@ export function CompanionVRM({
       window.removeEventListener("mousemove", onMouseMove);
       document.removeEventListener("visibilitychange", onVisibility);
       ro.disconnect();
-      endWalk();
+      if (stroll) {
+        stroll.dropped = true;
+        if (stroll.phase !== "measure") roamDriverRef.current?.current?.end();
+        stroll = null;
+      }
       mixer?.stopAllAction();
       vrmRef.current = null;
       if (vrm) {

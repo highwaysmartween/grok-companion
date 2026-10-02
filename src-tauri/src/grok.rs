@@ -10,12 +10,14 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
 pub const XAI_CHAT_URL: &str = "https://api.x.ai/v1/chat/completions";
 pub const XAI_MODELS_URL: &str = "https://api.x.ai/v1/models";
+/// API-mode fallback when no model is chosen. CLI mode passes no `-m` at all
+/// for an empty model, so the installed CLI picks its own default (grok-4.7 today).
 pub const DEFAULT_MODEL: &str = "grok-4.6";
 
 /// Max chat messages (user + assistant) forwarded to the brain per request.
@@ -37,6 +39,9 @@ pub struct GrokState {
     /// Highest-capability CLI flag set the installed grok accepted this session
     /// (see CLI_LEVEL_*). Downgraded only when the CLI rejects a flag.
     pub cli_level: AtomicU8,
+    /// Model id the installed CLI rejected this session ("unknown model id").
+    /// While the setting still names it we run without `-m` (CLI default).
+    pub cli_rejected_model: Mutex<Option<String>>,
 }
 
 impl GrokState {
@@ -45,8 +50,28 @@ impl GrokState {
             cancel: AtomicBool::new(false),
             cli_pid: AtomicU32::new(0),
             cli_level: AtomicU8::new(0),
+            cli_rejected_model: Mutex::new(None),
         }
     }
+
+    fn cli_model_rejected(&self, model: &str) -> bool {
+        self.cli_rejected_model
+            .lock()
+            .map(|g| g.as_deref() == Some(model))
+            .unwrap_or(false)
+    }
+
+    fn reject_cli_model(&self, model: &str) {
+        if let Ok(mut g) = self.cli_rejected_model.lock() {
+            *g = Some(model.to_string());
+        }
+    }
+}
+
+/// Is this brain-provider setting one that runs the Grok CLI?
+pub fn is_cli_provider_name(provider: &str) -> bool {
+    let p = provider.trim().to_lowercase();
+    !(p == "xai-api" || p == "api")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,6 +369,7 @@ pub async fn list_models(app: AppHandle) -> Result<Vec<String>, String> {
 
 fn fallback_models() -> Vec<String> {
     vec![
+        "grok-4.7".into(),
         "grok-4.6".into(),
         "grok-4.5".into(),
         "grok-4.3".into(),
@@ -524,6 +550,35 @@ fn looks_like_flag_error(stderr: &str) -> bool {
         || e.contains("usage:")
 }
 
+/// Does this CLI output say the requested model doesn't exist / can't be used?
+/// e.g. `Couldn't set model 'grok-4.6': Invalid params: unknown model id`.
+fn looks_like_model_error(output: &str) -> bool {
+    let e = output.to_lowercase();
+    e.contains("unknown model")
+        || e.contains("couldn't set model")
+        || e.contains("could not set model")
+        || e.contains("couldn\u{2019}t set model")
+        || e.contains("invalid model")
+        || e.contains("model not found")
+        || e.contains("no such model")
+        || e.contains("unsupported model")
+        || (e.contains("model")
+            && (e.contains("not found")
+                || e.contains("not available")
+                || e.contains("not supported")
+                || e.contains("does not exist")))
+}
+
+/// Normalised model the CLI should be asked for ("" / "default" = CLI default).
+fn cli_model_from_setting(model: &str) -> String {
+    let m = model.trim();
+    if m.eq_ignore_ascii_case("default") || m.eq_ignore_ascii_case("auto") {
+        String::new()
+    } else {
+        m.to_string()
+    }
+}
+
 fn os(s: &str) -> std::ffi::OsString {
     std::ffi::OsString::from(s)
 }
@@ -544,13 +599,16 @@ fn run_grok_cli(
     } else {
         s.companion_name.trim().to_string()
     };
-    let model = s.model.trim().to_string();
+    let model = cli_model_from_setting(&s.model);
     let system = build_system_prompt(app);
     let history = trim_history(messages);
+    // A model this CLI already rejected this session → straight to its default.
+    let mut use_model = !model.is_empty() && !state.cli_model_rejected(&model);
+    let mut model_retried = false;
 
     let _ = on_event.send(ChatStreamEvent::Started {
         request_id: request_id.to_string(),
-        model: if model.is_empty() { "grok-cli".into() } else { format!("grok-cli · {model}") },
+        model: if use_model { format!("grok-cli · {model}") } else { "grok-cli".into() },
     });
 
     let common = |args: &mut Vec<std::ffi::OsString>| {
@@ -591,7 +649,7 @@ fn run_grok_cli(
                 for a in ["--no-subagents", "--no-plan", "--no-memory", "--disallowed-tools", CLI_DISALLOWED_TOOLS] {
                     args.push(os(a));
                 }
-                if !model.is_empty() {
+                if use_model {
                     args.push(os("-m"));
                     args.push(os(&model));
                 }
@@ -605,6 +663,24 @@ fn run_grok_cli(
         let run = run_cli_once(&cli, &args, state)?;
         if state.cancel.load(Ordering::SeqCst) {
             return Ok(String::new());
+        }
+        // Unknown / unusable model → retry once without `-m` and remember it for
+        // the session. Some CLI builds print this on stdout, so check both, but
+        // never mistake a real (long) reply that merely mentions models.
+        let model_err = use_model
+            && level == CLI_LEVEL_FULL
+            && (looks_like_model_error(&run.stderr)
+                || (run.stdout.chars().count() < 400 && looks_like_model_error(&run.stdout)))
+            && (!run.success || run.stdout.chars().count() < 400);
+        if model_err && !model_retried {
+            eprintln!(
+                "[grok-cli] model '{model}' rejected ({}); retrying with the CLI default",
+                truncate(&format!("{} {}", run.stderr, run.stdout), 160)
+            );
+            state.reject_cli_model(&model);
+            use_model = false;
+            model_retried = true;
+            continue;
         }
         if !run.stdout.is_empty() {
             stream_text_as_deltas(on_event, request_id, &run.stdout, &state.cancel);
@@ -892,6 +968,43 @@ mod tests {
         let p = build_legacy_prompt(&system, "Nova", &trim_history(&msgs));
         assert!(p.chars().count() <= MAX_LEGACY_PROMPT_CHARS + 1);
         assert!(p.chars().count() + system.len() < 32_000);
+    }
+
+    #[test]
+    fn model_errors_detected() {
+        assert!(looks_like_model_error(
+            "Couldn't set model 'grok-4.6': Invalid params: unknown model id"
+        ));
+        assert!(looks_like_model_error("Error: Invalid params: unknown model id"));
+        assert!(looks_like_model_error("error: model 'grok-9' not found"));
+        assert!(looks_like_model_error("Could not set model grok-4.6"));
+        assert!(!looks_like_model_error("network timeout"));
+        assert!(!looks_like_model_error("error: unexpected argument '--no-plan' found"));
+        assert!(!looks_like_model_error("Hey you. Missed me?"));
+    }
+
+    #[test]
+    fn model_error_is_not_a_flag_error() {
+        // Must take the model-retry path, not downgrade the CLI flag level.
+        assert!(!looks_like_flag_error(
+            "Couldn't set model 'grok-4.6': Invalid params: unknown model id"
+        ));
+    }
+
+    #[test]
+    fn default_model_setting_means_no_flag() {
+        assert_eq!(cli_model_from_setting(""), "");
+        assert_eq!(cli_model_from_setting(" default "), "");
+        assert_eq!(cli_model_from_setting("grok-4.7"), "grok-4.7");
+    }
+
+    #[test]
+    fn rejected_model_is_remembered_per_model() {
+        let st = GrokState::new();
+        assert!(!st.cli_model_rejected("grok-4.6"));
+        st.reject_cli_model("grok-4.6");
+        assert!(st.cli_model_rejected("grok-4.6"));
+        assert!(!st.cli_model_rejected("grok-4.7"));
     }
 
     #[test]
