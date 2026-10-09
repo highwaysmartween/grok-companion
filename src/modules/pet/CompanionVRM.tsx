@@ -14,6 +14,10 @@ import {
   STROLL_TIMING,
   Tween,
   activityDuration,
+  FLASH_DURATION,
+  flashCoverUpElapsed,
+  flashFrame,
+  flashPrep,
   makeStrollMotion,
   pickActivity,
   pickIdleBase,
@@ -30,6 +34,7 @@ import {
   type RoamDriver,
   type StrollMotion,
 } from "./behaviour";
+import { FlashRig, FlashTop } from "./flash";
 
 export interface GestureCue {
   kind: GestureKind;
@@ -41,8 +46,10 @@ interface Props {
   mood: PetMood;
   className?: string;
   modelUrl?: string;
-  /** When true, hide CLOTH materials so the nude/lingerie body shows. */
+  /** Flash state from the app: true while flashed, false = "cover up" (lowers the top mid-flash). */
   flash?: boolean;
+  /** Bump to play the flash move once (she pulls her top up, holds, lowers it). */
+  flashKey?: number;
   /** How much she wanders. "off" = never walks (idle / look / turn still run). */
   roamAmount?: RoamAmount;
   /** Strolls allowed right now (not paused by hover / chat / tray). */
@@ -57,7 +64,7 @@ interface Props {
   roamDriver?: MutableRefObject<RoamDriver | null>;
 }
 
-export const PET_VRM_VERSION = 19;
+export const PET_VRM_VERSION = 20;
 
 /** Reactive modes override the self-directed activity loop (see behaviour.ts). */
 type Mode = "activity" | "attend" | "react" | "sleep";
@@ -114,6 +121,7 @@ const LIE_ZOOM = 0.5;
 // Session-wide (survive model swaps / remounts).
 let greetedThisSession = false;
 let lastHandledCue = 0;
+let lastHandledFlash = 0;
 /** DEV-only roam-amount override for the headless check (the browser preview has no settings). */
 let debugRoam: RoamAmount | null = null;
 
@@ -124,56 +132,6 @@ const CURSOR_POLL_MS = 100;
 const CURSOR_POLL_SLEEP_MS = 500;
 /** Cursor counts as "near" within this many px of the window edge. */
 const NEAR_PX = 140;
-
-const CLOTH_RE =
-  /CLOTH|SHOES|SOCK|ONEPIECE|TOPS|BOTTOMS|SKIRT|BRA|PANTY|LINGERIE|BIKINI|SWIM|UNDERWEAR|下着|服|靴|衣装|パンツ|ブラ/i;
-const KEEP_BODY_RE = /FACE|BODY|SKIN|HAIR|EYE|TOOTH|MOUTH|NAIL|舌|肌|髪|顔/i;
-
-type MatState = { visible: boolean; transparent: boolean; opacity: number; depthWrite: boolean };
-
-/** Hide/show a material, remembering its original state so "cover up" restores it exactly. */
-function hideMat(mat: THREE.Material, visible: boolean) {
-  const ud = mat.userData as { __petOrig?: MatState };
-  if (!ud.__petOrig) {
-    ud.__petOrig = {
-      visible: mat.visible,
-      transparent: mat.transparent,
-      opacity: (mat as THREE.MeshBasicMaterial).opacity ?? 1,
-      depthWrite: mat.depthWrite,
-    };
-  }
-  const o = ud.__petOrig;
-  if (visible) {
-    mat.visible = o.visible;
-    mat.transparent = o.transparent;
-    (mat as THREE.MeshBasicMaterial).opacity = o.opacity;
-    mat.depthWrite = o.depthWrite;
-  } else {
-    mat.visible = false;
-  }
-  mat.needsUpdate = true;
-}
-
-/** Hide cloth meshes/materials. Body/face/hair stay. */
-function setClothVisible(root: THREE.Object3D, visible: boolean) {
-  root.traverse((obj) => {
-    const mesh = obj as THREE.Mesh;
-    if (!mesh.isMesh) return;
-    const meshName = mesh.name || "";
-    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-    const nameHit = CLOTH_RE.test(meshName) && !KEEP_BODY_RE.test(meshName);
-    if (nameHit) {
-      mesh.visible = visible;
-      for (const mat of mats) if (mat) hideMat(mat, visible);
-      return;
-    }
-    for (const mat of mats) {
-      if (!mat?.name || !CLOTH_RE.test(mat.name)) continue;
-      if (KEEP_BODY_RE.test(mat.name)) continue;
-      hideMat(mat, visible);
-    }
-  });
-}
 
 /** Mood → target expression weights (only applied when the model has them). */
 function moodExpressions(m: PetMood, flash: boolean): Record<string, number> {
@@ -243,6 +201,7 @@ export function CompanionVRM({
   className,
   modelUrl = "/models/companion.vrm",
   flash = false,
+  flashKey = 0,
   roamAmount = "calm",
   roamAllowed = true,
   playful = false,
@@ -253,6 +212,7 @@ export function CompanionVRM({
   const mountRef = useRef<HTMLDivElement>(null);
   const moodRef = useRef(mood);
   const flashRef = useRef(flash);
+  const flashKeyRef = useRef(flashKey);
   const roamAmountRef = useRef(roamAmount);
   const roamAllowedRef = useRef(roamAllowed);
   const playfulRef = useRef(playful);
@@ -262,18 +222,13 @@ export function CompanionVRM({
   const roamDriverRef = useRef(roamDriver);
   moodRef.current = mood;
   flashRef.current = flash;
+  flashKeyRef.current = flashKey;
   roamAmountRef.current = (import.meta.env.DEV && debugRoam) || roamAmount;
   roamAllowedRef.current = (import.meta.env.DEV && debugRoam !== null) || roamAllowed;
   playfulRef.current = playful;
   reactKeyRef.current = reactKey;
   cueRef.current = cue;
   roamDriverRef.current = roamDriver;
-
-  useEffect(() => {
-    const v = vrmRef.current;
-    if (!v) return;
-    setClothVisible(v.scene, !flash);
-  }, [flash]);
 
   useEffect(() => {
     const el = mountRef.current;
@@ -348,6 +303,13 @@ export function CompanionVRM({
     let shot: Shot | null = null;
     let transition: Transition | null = null;
     let pendingCue: { kind: GestureKind; at: number } | null = null;
+    // Flash: requested → (stop / stand) → playing; cover-up jumps to lowering.
+    let flashTop: FlashTop | null = null;
+    let flashRig: FlashRig | null = null;
+    let flashReq: { at: number } | null = null;
+    let flashAct: { start: number; covered: boolean } | null = null;
+    let flashWasOn = flashRef.current;
+    let flashRaise = 0;
     let lastWaveAt = -1e9;
     let greetAt = -1;
     let lastInteractT = 0;
@@ -747,7 +709,9 @@ export function CompanionVRM({
         root.add(loaded.scene);
         vrm = loaded;
         vrmRef.current = loaded;
-        setClothVisible(loaded.scene, !flashRef.current);
+        flashTop = new FlashTop(loaded);
+        flashRig = new FlashRig(loaded, flashTop);
+        console.info("[pet] flash:", flashTop.mode, flashTop.reason, flashTop.topNames);
         mixer = new THREE.AnimationMixer(loaded.scene);
 
         const em = loaded.expressionManager;
@@ -829,6 +793,7 @@ export function CompanionVRM({
         m === "listening" ||
         m === "thinking" ||
         m === "sleeping" ||
+        !!flashReq ||
         !roamAllowedRef.current ||
         roamAmountRef.current === "off" ||
         pendingCue !== null ||
@@ -1113,9 +1078,22 @@ export function CompanionVRM({
         greetAt = -1;
         queueCue("wave");
       }
+      // Flash requests (once per key, even across the model swap the app does first).
+      const fk = flashKeyRef.current;
+      if (fk > lastHandledFlash) {
+        lastHandledFlash = fk;
+        if (flashRef.current && flashTop && flashTop.mode !== "none") {
+          flashReq = { at: t };
+          lastInteractT = t;
+        }
+      }
+      if (flashWasOn && !flashRef.current) coverUp();
+      flashWasOn = flashRef.current;
+      if (flashReq && t - flashReq.at > CUE_TTL) flashReq = null;
+
       if (pendingCue) {
         // Time spent finishing a stroll / getting up / a non-yielding shot doesn't count.
-        if (stroll || transition || (shot && !shot.interruptible)) pendingCue.at = Math.max(pendingCue.at, t - CUE_TTL + 3);
+        if (stroll || transition || flashReq || flashAct || (shot && !shot.interruptible)) pendingCue.at = Math.max(pendingCue.at, t - CUE_TTL + 3);
         else if (t - pendingCue.at > CUE_TTL) pendingCue = null;
       }
 
@@ -1131,6 +1109,34 @@ export function CompanionVRM({
         transition = null;
         tr.onDone?.();
         if (transition) return;
+      }
+      // Flash: stop and stand first (strolls ease out via strollInterrupted, she
+      // stands up / gets up), then the pull-up runs to completion uninterrupted.
+      // Models whose licence disallows sexual use (or with no separate top) never flash.
+      if (flashReq && (!flashTop || flashTop.mode === "none")) flashReq = null;
+      if (flashReq && !flashAct) {
+        const prep = flashPrep({ posture, strolling: !!stroll, transition: !!transition });
+        if (prep === "standUp") standUp();
+        else if (prep === "getUp") getUp();
+        if (prep !== "ready") return;
+        flashReq.at = t;
+        if (shot) endShot(0.35);
+        shot = null;
+        mode = "react";
+        modeUntil = t + FLASH_DURATION;
+        if (Math.abs(bodyTurn.target) > 1e-3) bodyTurn.set(0, t, 0.35);
+        crossfade(idleKey(), 0.35);
+        flashAct = { start: t, covered: false };
+        flashReq = null;
+        activity = "idle";
+        actUntil = t + FLASH_DURATION + rand(4, 8);
+        return;
+      }
+      if (flashAct) {
+        if (t - flashAct.start < FLASH_DURATION) return;
+        flashAct = null;
+        lastInteractT = t;
+        enterMode("react", 0.6);
       }
       // One-shots: settle back when done; idle variations yield to the user.
       if (shot) {
@@ -1274,7 +1280,7 @@ export function CompanionVRM({
       if (speaking) ensureClip("talk");
       const a = actions.talk;
       if (!a) return;
-      const want = speaking && posture === "stand" && !transition && !stroll && !shot ? 1 : 0;
+      const want = speaking && posture === "stand" && !transition && !stroll && !shot && !flashAct ? 1 : 0;
       talkW = damp(talkW, want, want ? 2.5 : 3.5, dt);
       if (talkW > 0.01) {
         if (!a.isRunning()) a.reset().play();
@@ -1384,11 +1390,42 @@ export function CompanionVRM({
       }
     };
 
+    /** "Cover up": lower from wherever the hem is now (never a snap); cancel a queued flash. */
+    function coverUp() {
+      flashReq = null;
+      if (flashAct && !flashAct.covered) {
+        flashAct.covered = true;
+        flashAct.start = t - flashCoverUpElapsed(t - flashAct.start);
+      }
+    }
+
+    const applyFlash = () => {
+      if (!vrm || !flashTop) return;
+      if (!flashAct || !flashRig) {
+        if (flashRaise !== 0) flashTop.setLift(0);
+        flashRaise = 0;
+        return;
+      }
+      const f = flashFrame(t - flashAct.start);
+      // The top follows where the hands actually are.
+      flashRaise = flashRig.apply(f, t, mirror);
+      flashTop.setLift(flashRaise);
+    };
+
     const applyExpressions = (dt: number) => {
       if (!vrm?.expressionManager) return;
       const m = effMood();
       const target = moodExpressions(mode === "sleep" ? "sleeping" : m, flashRef.current);
       if (shot?.key === "kiss" || shot?.key === "joyJump") target.happy = Math.max(target.happy ?? 0, 0.5);
+      const ff = flashAct ? flashFrame(t - flashAct.start) : null;
+      if (ff) {
+        // Playful: a cheeky smile as she reaches, full grin + giggle while it's up.
+        target.happy = Math.max(target.happy ?? 0, 0.35 + 0.45 * ff.raise);
+        target.relaxed = 0.15 * (1 - ff.raise);
+        target.surprised = 0;
+        target.angry = 0;
+        target.sad = 0;
+      }
       for (const [n, v] of Object.entries(target)) {
         expr[n] = damp(expr[n] ?? 0, v, 4, dt);
         setExpr(n, expr[n]);
@@ -1401,7 +1438,9 @@ export function CompanionVRM({
       setExpr("blink", Math.max(t < blinkUntil ? 1 : 0, sleepBlend));
       // Talking mouth driven by speaking state.
       const talking = m === "speaking";
-      const mouth = talking ? 0.12 + Math.abs(Math.sin(t * 9.5)) * 0.38 * (0.75 + 0.25 * Math.sin(t * 2.3)) : 0;
+      // Giggle: short mouth bursts through the hold.
+      const giggle = ff && ff.hold > 0 ? Math.max(0, Math.sin(ff.hold * Math.PI * 7)) * 0.32 * Math.sin(ff.hold * Math.PI) : 0;
+      const mouth = Math.max(giggle, talking ? 0.12 + Math.abs(Math.sin(t * 9.5)) * 0.38 * (0.75 + 0.25 * Math.sin(t * 2.3)) : 0);
       expr.aa = damp(expr.aa ?? 0, mouth, 18, dt);
       setExpr("aa", expr.aa);
       expr.oh = damp(expr.oh ?? 0, talking ? Math.max(0, Math.sin(t * 4.1)) * 0.18 : 0, 12, dt);
@@ -1421,6 +1460,7 @@ export function CompanionVRM({
         for (const n of PROC_BONES) bone(n)?.quaternion.identity();
         mixer.update(dt);
         applyProcedural(dt);
+        applyFlash();
         applyExpressions(dt);
         vrm.update(dt);
       }
@@ -1518,6 +1558,26 @@ export function CompanionVRM({
           roamAllowedRef.current = a !== null || roamAllowed;
         },
         cue: (k: GestureKind) => queueCue(k),
+        /** Play the flash move (bypasses the app; the model must support it). */
+        flash: () => {
+          flashReq = { at: t };
+          return flashTop ? { mode: flashTop.mode, reason: flashTop.reason, tops: flashTop.topNames } : null;
+        },
+        coverUp: () => coverUp(),
+        flashState: () => ({
+          mode: flashTop?.mode ?? null,
+          req: !!flashReq,
+          phase: flashAct ? flashFrame(t - flashAct.start).phase : null,
+          elapsed: flashAct ? +(t - flashAct.start).toFixed(2) : null,
+          raise: +flashRaise.toFixed(3),
+          lift: +(flashTop?.lift ?? 0).toFixed(3),
+          posture,
+          stroll: stroll?.phase ?? null,
+        }),
+        /** Turn her (radians) — side views for the headless check. */
+        yaw: (r: number) => bodyTurn.set(r, t, 0.01),
+        /** Force posture for prep checks. */
+        sit: () => sitDown(),
         activity: (a: ActivityId) => {
           if (a === "stroll" || a === "visitIcon") roamDriverRef.current = { current: fakeDriver };
           startActivity(a);
