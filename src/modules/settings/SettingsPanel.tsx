@@ -1,12 +1,27 @@
 import { FormEvent, useEffect, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { isEnabled as autostartIsEnabled } from "@tauri-apps/plugin-autostart";
 import type { MemoryFact, PublicSettings } from "../../types";
 import { clearApiKey, saveApiKey, saveSettings } from "./settingsApi";
 import { deleteMemory, listMemories } from "../memory/memoryApi";
+import { normalizeRoamAmount } from "../pet/behaviour";
 import "./SettingsPanel.css";
 
+const ROAM_AMOUNTS = [
+  { id: "off", label: "Off — stays put" },
+  { id: "calm", label: "Calm — the odd short stroll (default)" },
+  { id: "lively", label: "Lively — strolls more often" },
+];
+
+const VOICES = [
+  { id: "en-HK-YanNeural", label: "Yan (HK English) — default" },
+  { id: "en-SG-LunaNeural", label: "Luna (SG English)" },
+  { id: "en-US-AvaNeural", label: "Ava (US English)" },
+  { id: "en-US-AriaNeural", label: "Aria (US English)" },
+];
+
 const PERSONALITIES = [
-  { id: "chill", label: "Chill 18 (English)" },
+  { id: "chill", label: "Chill 18, flirty (English)" },
   { id: "firstdate", label: "First date" },
   { id: "cosmic", label: "Cosmic companion" },
   { id: "witty", label: "Witty" },
@@ -20,9 +35,12 @@ interface Props {
   models: string[];
   onClose: () => void;
   onSaved: (s: PublicSettings) => void;
+  /** Wipes the on-screen / stored conversation (memories are separate). */
+  onClearChat: () => void;
+  chatCount: number;
 }
 
-export function SettingsPanel({ settings, models, onClose, onSaved }: Props) {
+export function SettingsPanel({ settings, models, onClose, onSaved, onClearChat, chatCount }: Props) {
   const [apiKey, setApiKey] = useState("");
   const [name, setName] = useState(settings.companionName);
   const [model, setModel] = useState(settings.model);
@@ -34,12 +52,20 @@ export function SettingsPanel({ settings, models, onClose, onSaved }: Props) {
   const [temperature, setTemperature] = useState(settings.temperature);
   const [maxTokens, setMaxTokens] = useState(settings.maxTokens);
   const [brainProvider, setBrainProvider] = useState(settings.brainProvider || "grok-cli");
+  const [voiceTarget, setVoiceTarget] = useState(settings.voiceTarget || "en-HK-YanNeural");
+  const [autostart, setAutostart] = useState(settings.autostart);
+  const [roamAmount, setRoamAmount] = useState(normalizeRoamAmount(settings.roamAmount));
+  const [wakeWordEnabled, setWakeWordEnabled] = useState(settings.wakeWordEnabled);
+  const [playful, setPlayful] = useState(!!settings.playful);
+  const [autostartOs, setAutostartOs] = useState<boolean | null>(null);
+  const [confirmClear, setConfirmClear] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [facts, setFacts] = useState<MemoryFact[]>([]);
 
   useEffect(() => {
     listMemories().then(setFacts).catch(() => setFacts([]));
+    autostartIsEnabled().then(setAutostartOs).catch(() => setAutostartOs(null));
   }, []);
 
   const save = async (e: FormEvent) => {
@@ -58,9 +84,17 @@ export function SettingsPanel({ settings, models, onClose, onSaved }: Props) {
         temperature,
         maxTokens,
         brainProvider,
-        voiceTarget: settings.voiceTarget || 'en-HK-YanNeural',
-        characterModel: settings.characterModel || '',
+        voiceTarget: voiceTarget || "en-HK-YanNeural",
+        characterModel: settings.characterModel || "",
+        autostart,
+        // Picking a (new) amount un-pauses tray "Pause roaming"; otherwise keep it.
+        roamEnabled:
+          roamAmount !== "off" && roamAmount !== normalizeRoamAmount(settings.roamAmount) ? true : settings.roamEnabled,
+        roamAmount,
+        wakeWordEnabled,
+        playful,
       });
+      autostartIsEnabled().then(setAutostartOs).catch(() => undefined);
       if (apiKey.trim()) {
         next = await saveApiKey(apiKey.trim());
         setApiKey("");
@@ -87,7 +121,9 @@ export function SettingsPanel({ settings, models, onClose, onSaved }: Props) {
     }
   };
 
-  const uniqueModels = Array.from(new Set([...models, settings.model, "grok-4.6", "grok-4.5", "grok-4.3"]));
+  const uniqueModels = Array.from(
+    new Set([...models, settings.model, "grok-4.7", "grok-4.6", "grok-4.5"].filter((m) => m && m !== "default")),
+  );
 
   return (
     <div className="settings-backdrop" role="dialog" aria-label="Settings">
@@ -130,7 +166,8 @@ export function SettingsPanel({ settings, models, onClose, onSaved }: Props) {
 
         <label>
           Model
-          <select value={model} onChange={(e) => setModel(e.target.value)}>
+          <select value={model === "default" ? "" : model} onChange={(e) => setModel(e.target.value)}>
+            <option value="">Default ({brainProvider === "xai-api" ? "API default" : "CLI's own default"})</option>
             {uniqueModels.map((m) => (
               <option key={m} value={m}>
                 {m}
@@ -167,6 +204,17 @@ export function SettingsPanel({ settings, models, onClose, onSaved }: Props) {
         )}
 
         <label>
+          Voice (Edge neural)
+          <select value={voiceTarget} onChange={(e) => setVoiceTarget(e.target.value)}>
+            {[...VOICES, ...(VOICES.some((v) => v.id === voiceTarget) ? [] : [{ id: voiceTarget, label: voiceTarget }])].map((v) => (
+              <option key={v.id} value={v.id}>
+                {v.label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label>
           System prompt
           <textarea value={systemPrompt} onChange={(e) => setSystemPrompt(e.target.value)} rows={4} />
         </label>
@@ -184,7 +232,37 @@ export function SettingsPanel({ settings, models, onClose, onSaved }: Props) {
             <input type="checkbox" checked={autoSpeak} onChange={(e) => setAutoSpeak(e.target.checked)} />
             Auto-speak replies
           </label>
+          <label className="check">
+            <input type="checkbox" checked={wakeWordEnabled} onChange={(e) => setWakeWordEnabled(e.target.checked)} />
+            “Hey” wake word
+          </label>
+          <label className="check">
+            <input type="checkbox" checked={autostart} onChange={(e) => setAutostart(e.target.checked)} />
+            Launch with Windows
+          </label>
+          <label className="check" title="Lets her walk over to desktop icons and jump on them (icon detection comes later)">
+            <input type="checkbox" checked={playful} onChange={(e) => setPlayful(e.target.checked)} />
+            Playful (jump on icons)
+          </label>
         </div>
+        <label>
+          Roam amount
+          <select value={roamAmount} onChange={(e) => setRoamAmount(normalizeRoamAmount(e.target.value))}>
+            {ROAM_AMOUNTS.map((r) => (
+              <option key={r.id} value={r.id}>
+                {r.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        {!settings.roamEnabled && roamAmount !== "off" && (
+          <p className="fine">Roaming is paused from the tray menu (choosing a different amount here un-pauses it).</p>
+        )}
+        {autostartOs !== null && autostartOs !== autostart && (
+          <p className="fine">
+            Launch-at-login is currently {autostartOs ? "on" : "off"} in Windows; Save to apply (dev builds never register).
+          </p>
+        )}
 
         <label>
           Temperature {temperature.toFixed(2)}
@@ -225,6 +303,29 @@ export function SettingsPanel({ settings, models, onClose, onSaved }: Props) {
               </li>
             ))}
           </ul>
+        </section>
+
+        <section className="memories">
+          <h3>Chat history</h3>
+          <p className="fine">
+            {chatCount} message{chatCount === 1 ? "" : "s"} on screen. Clearing doesn't touch memories above.
+          </p>
+          <button
+            type="button"
+            className="link danger"
+            onClick={() => {
+              if (!confirmClear) {
+                setConfirmClear(true);
+                window.setTimeout(() => setConfirmClear(false), 4000);
+                return;
+              }
+              setConfirmClear(false);
+              onClearChat();
+              setStatus("Chat history cleared.");
+            }}
+          >
+            {confirmClear ? "Tap again to clear chat history" : "Clear chat history"}
+          </button>
         </section>
 
         {status && <p className="status-msg">{status}</p>}

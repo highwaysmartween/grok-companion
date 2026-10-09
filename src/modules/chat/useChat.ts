@@ -1,21 +1,30 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChatMessage, PetMood, PublicSettings } from "../../types";
-import { handleMemoryIntent, parseMemoryIntent } from "../memory/memoryIntent";
+import { extractAutoFacts, handleMemoryIntent, parseMemoryIntent } from "../memory/memoryIntent";
+import { rememberFact } from "../memory/memoryApi";
 import { cancelChat, streamChat } from "./chatApi";
 
 const HISTORY_KEY = "grok-companion.conversation.v1";
+/** Messages (user + assistant) sent to the brain per request; memory facts ride in the system prompt. */
+const SEND_HISTORY = 20;
+/** Messages kept on screen / in localStorage. */
+const KEEP_HISTORY = 80;
 const uid = () => crypto.randomUUID();
 
 function loadHistory(): ChatMessage[] {
   try {
     const value = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
-    return Array.isArray(value) ? value.filter((m) => m && m.role && m.content) : [];
+    return Array.isArray(value)
+      ? value.filter((m) => m && m.role && m.content && !m.pending).slice(-KEEP_HISTORY)
+      : [];
   } catch {
     return [];
   }
 }
 
-function emotionForReply(text: string): PetMood {
+const capped = (list: ChatMessage[]) => (list.length > KEEP_HISTORY ? list.slice(-KEEP_HISTORY) : list);
+
+export function emotionForReply(text: string): PetMood {
   const lower = text.toLowerCase();
   if (/sorry|error|can't|cannot|failed|unable|glitch/.test(lower)) return "error";
   if (/not sure|confused|unclear|what do you mean/.test(lower)) return "confused";
@@ -27,6 +36,8 @@ export interface ChatController {
   settings: PublicSettings | null;
   setMood: (mood: PetMood) => void;
   speakReply?: (text: string) => void;
+  /** Called once per finished brain reply with its text and the mood it set. */
+  onReply?: (text: string, mood: PetMood) => void;
 }
 
 const VOICE_FALLBACKS = [
@@ -48,7 +59,7 @@ export function useChat(controller: ChatController) {
 
   useEffect(() => {
     try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(messages.slice(-100)));
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(messages.filter((m) => !m.pending).slice(-KEEP_HISTORY)));
     } catch { /* storage can be unavailable in preview mode */ }
   }, [messages]);
 
@@ -58,9 +69,12 @@ export function useChat(controller: ChatController) {
     aborting.current = false;
     setError(null);
     const userMsg: ChatMessage = { id: uid(), role: "user", content: text };
-    const history = [...messagesRef.current.filter((m) => !m.error && m.content), userMsg].map((m) => ({ role: m.role, content: m.content }));
-    messagesRef.current = [...messagesRef.current, userMsg];
-    setMessages((m) => [...m, userMsg]);
+    // Only real conversation (no local memory replies / errors), newest SEND_HISTORY messages.
+    const history = [...messagesRef.current.filter((m) => !m.error && !m.local && !m.pending && m.content), userMsg]
+      .slice(-SEND_HISTORY)
+      .map((m) => ({ role: m.role, content: m.content }));
+    messagesRef.current = capped([...messagesRef.current, userMsg]);
+    setMessages((m) => capped([...m, userMsg]));
     const { settings, setMood, speakReply } = ctrl.current;
     const wantSpeak = settings?.ttsEnabled !== false && (meta?.fromVoice === true || settings?.autoSpeak !== false);
 
@@ -78,7 +92,14 @@ export function useChat(controller: ChatController) {
       return;
     }
 
-    if (!settings?.hasApiKey) {
+    // Lightweight automatic memory for clear statements ("my name is…", "I like…").
+    for (const f of extractAutoFacts(text)) {
+      void rememberFact(f.fact, f.replacePrefix).catch(() => undefined);
+    }
+
+    // API brain without a key can't work at all. For the CLI brain we still try even if
+    // the readiness probe says "not signed in" — the CLI's own error is more precise.
+    if (!settings || (!settings.hasApiKey && settings.brainProvider === "xai-api")) {
       const tip = "I need Grok connected before I can talk. Open Settings and choose Grok CLI or add an xAI API key.";
       setMessages((m) => [...m, { id: uid(), role: "assistant", content: tip, local: true, error: true }]);
       setMood("error");
@@ -109,7 +130,9 @@ export function useChat(controller: ChatController) {
         }
       });
       if (!aborting.current && assembled) {
-        setMood(emotionForReply(assembled));
+        const replyMood = emotionForReply(assembled);
+        setMood(replyMood);
+        ctrl.current.onReply?.(assembled, replyMood);
         if (wantSpeak) speakReply?.(assembled);
       } else if (!assembled) {
         const fallback = VOICE_FALLBACKS[Math.floor(Math.random() * VOICE_FALLBACKS.length)]!;

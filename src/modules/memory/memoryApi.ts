@@ -5,8 +5,9 @@ export async function listMemories(): Promise<MemoryFact[]> {
   return invoke<MemoryFact[]>("memory_list");
 }
 
-export async function rememberFact(fact: string): Promise<MemoryFact> {
-  return invoke<MemoryFact>("memory_remember", { fact });
+/** `replacePrefix`: drop older facts starting with this first (e.g. "User's name is"). */
+export async function rememberFact(fact: string, replacePrefix?: string): Promise<MemoryFact> {
+  return invoke<MemoryFact>("memory_remember", { fact, replacePrefix: replacePrefix ?? null });
 }
 
 export async function deleteMemory(id: string): Promise<MemoryFact[]> {

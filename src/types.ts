@@ -38,6 +38,13 @@ export interface PublicSettings {
   brainProvider: BrainProvider | string;
   voiceTarget: string;
   characterModel: string;
+  autostart: boolean;
+  roamEnabled: boolean;
+  /** "off" | "calm" | "lively" */
+  roamAmount: string;
+  wakeWordEnabled: boolean;
+  /** "Playful (jump on icons)" — default off. */
+  playful: boolean;
 }
 
 export interface SettingsPayload {
@@ -53,6 +60,13 @@ export interface SettingsPayload {
   brainProvider: BrainProvider | string;
   voiceTarget: string;
   characterModel: string;
+  autostart: boolean;
+  roamEnabled: boolean;
+  /** "off" | "calm" | "lively" */
+  roamAmount: string;
+  wakeWordEnabled: boolean;
+  /** "Playful (jump on icons)" — default off. */
+  playful: boolean;
 }
 
 export interface ConnectionStatus {

@@ -9,6 +9,12 @@ use uuid::Uuid;
 
 const STORE_FILE: &str = "memory.json";
 const KEY_FACTS: &str = "facts";
+/// Hard cap on stored facts (oldest dropped first).
+const MAX_FACTS: usize = 200;
+/// Facts injected into the system prompt (newest first wins).
+const PROMPT_FACTS: usize = 40;
+const PROMPT_FACTS_CHARS: usize = 2_500;
+const MAX_FACT_CHARS: usize = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,21 +53,35 @@ fn save_facts(app: &AppHandle, facts: &[MemoryFact]) -> Result<(), String> {
     store.save().map_err(|e| format!("Could not save memory: {e}"))
 }
 
-#[tauri::command]
+fn norm(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+#[tauri::command(async)]
 pub fn memory_list(app: AppHandle) -> Result<Vec<MemoryFact>, String> {
     load_facts(&app)
 }
 
-#[tauri::command]
-pub fn memory_remember(app: AppHandle, fact: String) -> Result<MemoryFact, String> {
-    let fact = fact.trim().to_string();
+/// Remember a fact. `replace_prefix` (case-insensitive) first removes older facts
+/// starting with that prefix — e.g. "User's name is" so a new name replaces the old.
+#[tauri::command(async)]
+pub fn memory_remember(
+    app: AppHandle,
+    fact: String,
+    replace_prefix: Option<String>,
+) -> Result<MemoryFact, String> {
+    let fact: String = fact.trim().chars().take(MAX_FACT_CHARS).collect();
     if fact.is_empty() {
         return Err("Nothing to remember".into());
     }
     let mut facts = load_facts(&app)?;
-    // De-dupe exact matches (case-insensitive).
-    if let Some(existing) = facts.iter().find(|f| f.fact.eq_ignore_ascii_case(&fact)) {
+    // De-dupe exact matches (case/whitespace-insensitive).
+    let key = norm(&fact);
+    if let Some(existing) = facts.iter().find(|f| norm(&f.fact) == key) {
         return Ok(existing.clone());
+    }
+    if let Some(prefix) = replace_prefix.map(|p| norm(&p)).filter(|p| !p.is_empty()) {
+        facts.retain(|f| !norm(&f.fact).starts_with(&prefix));
     }
     let entry = MemoryFact {
         id: Uuid::new_v4().to_string(),
@@ -69,25 +89,34 @@ pub fn memory_remember(app: AppHandle, fact: String) -> Result<MemoryFact, Strin
         created_at: now_secs(),
     };
     facts.push(entry.clone());
+    if facts.len() > MAX_FACTS {
+        let excess = facts.len() - MAX_FACTS;
+        facts.drain(..excess);
+    }
     save_facts(&app, &facts)?;
     Ok(entry)
 }
 
-#[tauri::command]
+/// Delete exactly one fact: by id, or by an exact (case/whitespace-insensitive)
+/// fact text match. Never a substring wipe.
+#[tauri::command(async)]
 pub fn memory_delete(app: AppHandle, id: String) -> Result<Vec<MemoryFact>, String> {
     let mut facts = load_facts(&app)?;
-    let before = facts.len();
-    facts.retain(|f| f.id != id);
-    if facts.len() == before {
-        // Also allow deleting by substring of the fact text.
-        let needle = id.to_lowercase();
-        facts.retain(|f| !f.fact.to_lowercase().contains(&needle));
+    let pos = facts
+        .iter()
+        .position(|f| f.id == id)
+        .or_else(|| {
+            let key = norm(&id);
+            facts.iter().position(|f| norm(&f.fact) == key)
+        });
+    if let Some(i) = pos {
+        facts.remove(i);
+        save_facts(&app, &facts)?;
     }
-    save_facts(&app, &facts)?;
     Ok(facts)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn memory_clear(app: AppHandle) -> Result<(), String> {
     save_facts(&app, &[])
 }
@@ -100,10 +129,22 @@ pub fn format_for_prompt(app: &AppHandle) -> String {
     if facts.is_empty() {
         return String::new();
     }
+    // Newest facts are most relevant; keep a bounded block.
+    let mut picked: Vec<&MemoryFact> = Vec::new();
+    let mut total = 0usize;
+    for f in facts.iter().rev().take(PROMPT_FACTS) {
+        let len = f.fact.chars().count();
+        if total + len > PROMPT_FACTS_CHARS {
+            break;
+        }
+        total += len;
+        picked.push(f);
+    }
+    picked.reverse();
     let mut out = String::from(
         "\n\nThings you remember about this user (only mention when relevant; do not dump the list unless asked):\n",
     );
-    for (i, f) in facts.iter().enumerate() {
+    for (i, f) in picked.iter().enumerate() {
         out.push_str(&format!("{}. {}\n", i + 1, f.fact));
     }
     out

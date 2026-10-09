@@ -2,7 +2,9 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main companion window",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "core:event:default",
@@ -17,6 +19,13 @@
     "core:window:allow-outer-size",
     "core:window:allow-current-monitor",
     "core:window:allow-primary-monitor",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-is-visible",
+    "core:window:allow-is-minimized",
+    "core:window:allow-unminimize",
+    "core:window:allow-scale-factor",
+    "autostart:default",
     "store:default",
     "opener:default"
   ]

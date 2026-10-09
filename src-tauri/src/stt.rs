@@ -1,92 +1,96 @@
-//! Offline Windows speech via System.Speech. Scripts run from a temp .ps1 file
-//! (more reliable than powershell -Command with long strings).
+//! Offline Windows speech via System.Speech (PowerShell, hidden window).
 //!
-//! Wake word root cause (why "hey" didn't fire):
-//! 1) Default CFGConfidenceRejectionThreshold (~90) rejects short keywords like "hey".
-//! 2) A single long Recognize() held the mic exclusively and competed with tap-to-talk.
-//! Fix: lower rejection threshold, expand aliases, short Recognize windows, dictation
-//! backup, and stt_cancel_wake so tap-to-talk can free the device.
+//! Wake word design (v1.1.1):
+//! * Grammar is only the wake phrase ("hey", "hey <name>") — the old free-dictation
+//!   backup grammar matched almost any speech and caused false triggers.
+//! * A second grammar "hey <dictation>" lets "hey what's up" arrive in one breath:
+//!   the wake word's own word-confidence is checked, the rest is the command.
+//! * Confidence: engine rejection threshold raised (20 → 45) and the script also
+//!   requires the wake word confidence ≥ `min_confidence` (default 0.6).
+//! * After a bare "hey" the SAME warm engine switches to dictation immediately
+//!   (no new PowerShell / engine spin-up), so the first words aren't lost. The
+//!   script prints `WAKE` the moment it hears the wake word; Rust forwards that
+//!   as the `stt-wake` event so the UI can show "go ahead" / play an ack.
+//! * Every PowerShell PID is tracked so wake + manual listening are cancelable.
 
-use std::fs;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::State;
+use crate::proc;
+use serde::Serialize;
+use std::io::{BufRead, BufReader};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, State};
 
+#[derive(Default)]
 pub struct SttState {
     /// PID of the active wake-word PowerShell (0 = none).
-    pub wake_pid: Arc<AtomicU32>,
-    pub wake_script: Mutex<Option<std::path::PathBuf>>,
+    pub wake_pid: AtomicU32,
+    pub wake_gen: AtomicU64,
+    /// PID of the active manual (tap-to-talk) PowerShell (0 = none).
+    pub listen_pid: AtomicU32,
+    pub listen_gen: AtomicU64,
 }
 
-impl Default for SttState {
-    fn default() -> Self {
-        Self {
-            wake_pid: Arc::new(AtomicU32::new(0)),
-            wake_script: Mutex::new(None),
-        }
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeOutcome {
+    /// "wake" | "timeout" | "cancelled"
+    pub status: String,
+    /// Command spoken after the wake word (may be empty).
+    pub text: String,
+}
+
+fn not_windows() -> Result<(), String> {
+    if cfg!(windows) {
+        Ok(())
+    } else {
+        Err("Offline Windows speech is only available on Windows.".into())
     }
 }
 
-fn kill_pid(pid: u32) {
-    if pid == 0 {
-        return;
-    }
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+/// Keep wake words to plain letters/spaces so they are safe inside a PS string.
+fn sanitize_phrase(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphabetic() || *c == ' ' || *c == '\'')
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+        .chars()
+        .take(32)
+        .collect()
 }
 
-fn run_ps_file(script: &str) -> Result<(i32, String, String), String> {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("grok-stt-{stamp}.ps1"));
-    fs::write(&path, script).map_err(|e| format!("Could not write STT script: {e}"))?;
-
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            path.to_str().ok_or("bad STT script path")?,
-        ])
-        .output()
-        .map_err(|e| format!("Could not start Windows speech: {e}"))?;
-
-    let _ = fs::remove_file(&path);
-    let code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Ok((code, stdout, stderr))
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
-#[tauri::command]
-pub async fn stt_listen_windows(timeout_secs: Option<u32>) -> Result<String, String> {
-    let secs = timeout_secs.unwrap_or(12).clamp(5, 30);
-    let script = format!(
-        r#"
+const ENGINE_PRELUDE: &str = r#"
 Add-Type -AssemblyName System.Speech
 $ErrorActionPreference = 'Stop'
+function New-Engine {
+  try {
+    $c = [Globalization.CultureInfo]::GetCultureInfo('en-US')
+    $e = New-Object System.Speech.Recognition.SpeechRecognitionEngine $c
+  } catch {
+    $e = New-Object System.Speech.Recognition.SpeechRecognitionEngine
+  }
+  $e.SetInputToDefaultAudioDevice()
+  return $e
+}
+"#;
+
+fn listen_script(secs: u32) -> String {
+    format!(
+        r#"{ENGINE_PRELUDE}
 try {{
-  $culture = [Globalization.CultureInfo]::GetCultureInfo('en-US')
-  try {{
-    $eng = New-Object System.Speech.Recognition.SpeechRecognitionEngine $culture
-  }} catch {{
-    $eng = New-Object System.Speech.Recognition.SpeechRecognitionEngine
-  }}
-  $eng.SetInputToDefaultAudioDevice()
+  $eng = New-Engine
   $dictation = New-Object System.Speech.Recognition.DictationGrammar
   $eng.LoadGrammar($dictation)
   $eng.InitialSilenceTimeout = [TimeSpan]::FromSeconds(6)
-  $eng.BabbleTimeout = [TimeSpan]::FromSeconds(5)
-  $eng.EndSilenceTimeout = [TimeSpan]::FromSeconds(1.8)
+  $eng.BabbleTimeout = [TimeSpan]::FromSeconds(8)
+  $eng.EndSilenceTimeout = [TimeSpan]::FromSeconds(1.2)
   $result = $eng.Recognize([TimeSpan]::FromSeconds({secs}))
   if ($null -eq $result -or [string]::IsNullOrWhiteSpace($result.Text)) {{
     Write-Output ''
@@ -98,12 +102,51 @@ try {{
   exit 2
 }}
 "#
-    );
+    )
+}
 
-    let (code, stdout, stderr) = tauri::async_runtime::spawn_blocking(move || run_ps_file(&script))
-        .await
-        .map_err(|e| format!("STT task failed: {e}"))??;
+fn run_ps_file_tracked(
+    script: &str,
+    slot: &AtomicU32,
+    still_wanted: &dyn Fn() -> bool,
+) -> Result<(i32, String, String), String> {
+    let path = proc::temp_file("stt", "ps1");
+    std::fs::write(&path, script).map_err(|e| format!("Could not write STT script: {e}"))?;
+    let _guard = proc::TempFile(path.clone());
+    let mut cmd = proc::command("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&path);
+    let output = proc::run_tracked_checked(cmd, slot, still_wanted).map_err(|e| format!("Could not start Windows speech: {e}"))?;
+    Ok((
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    ))
+}
 
+/// Tap-to-talk offline dictation. Cancel with `stt_cancel_listen`.
+#[tauri::command]
+pub async fn stt_listen_windows(
+    timeout_secs: Option<u32>,
+    state: State<'_, Arc<SttState>>,
+) -> Result<String, String> {
+    not_windows()?;
+    let secs = timeout_secs.unwrap_or(12).clamp(5, 30);
+    let st = Arc::clone(&*state);
+    // A new manual listen replaces any previous one.
+    proc::kill_slot(&st.listen_pid);
+    let gen = st.listen_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let st2 = Arc::clone(&st);
+    let (code, stdout, stderr) = tauri::async_runtime::spawn_blocking(move || {
+        let wanted = || st2.listen_gen.load(Ordering::SeqCst) == gen;
+        run_ps_file_tracked(&listen_script(secs), &st2.listen_pid, &wanted)
+    })
+    .await
+    .map_err(|e| format!("STT task failed: {e}"))??;
+
+    if st.listen_gen.load(Ordering::SeqCst) != gen {
+        return Err("cancelled".into());
+    }
     if code != 0 {
         let detail = if stderr.is_empty() {
             "engine error (no details)".into()
@@ -115,165 +158,225 @@ try {{
         ));
     }
     if stdout.is_empty() {
-        Err("Didn't catch speech — tap again, speak clearly after Listening appears.".into())
+        Err("Didn't catch that — tap again and talk after it says Listening.".into())
     } else {
         Ok(stdout)
     }
 }
 
 #[tauri::command]
-pub async fn stt_wait_wake_word(
-    word: Option<String>,
-    state: State<'_, SttState>,
-) -> Result<String, String> {
-    let wake = word.unwrap_or_else(|| "hey".into());
-    let wake_esc = wake.replace('\'', "''");
+pub async fn stt_cancel_listen(state: State<'_, Arc<SttState>>) -> Result<(), String> {
+    let st = Arc::clone(&*state);
+    st.listen_gen.fetch_add(1, Ordering::SeqCst);
+    tauri::async_runtime::spawn_blocking(move || proc::kill_slot(&st.listen_pid))
+        .await
+        .map_err(|e| format!("cancel failed: {e}"))
+}
 
-    // Kill any prior wake listener so we never stack exclusive mic holders.
-    kill_pid(state.wake_pid.swap(0, Ordering::SeqCst));
-    if let Ok(mut slot) = state.wake_script.lock() {
-        if let Some(path) = slot.take() {
-            let _ = fs::remove_file(path);
-        }
-    }
-
-    let script = format!(
-        r#"
-Add-Type -AssemblyName System.Speech
-$ErrorActionPreference = 'Stop'
+fn wake_script(phrases: &[String], head: &str, min_conf: f32, command_secs: u32) -> String {
+    let list = phrases.iter().map(|p| ps_quote(p)).collect::<Vec<_>>().join(",");
+    format!(
+        r#"{ENGINE_PRELUDE}
 try {{
-  $culture = [Globalization.CultureInfo]::GetCultureInfo('en-US')
-  try {{
-    $eng = New-Object System.Speech.Recognition.SpeechRecognitionEngine $culture
-  }} catch {{
-    $eng = New-Object System.Speech.Recognition.SpeechRecognitionEngine
-  }}
-  $eng.SetInputToDefaultAudioDevice()
-  # Root cause fix: default CFGConfidenceRejectionThreshold (~90) drops short
-  # wake words like "hey". Lower it so a clear "hey" actually fires.
-  try {{ $eng.UpdateRecognizerSetting('CFGConfidenceRejectionThreshold', 20) }} catch {{}}
-  try {{ $eng.UpdateRecognizerSetting('CFG_Confidence_Rejection_Threshold', 20) }} catch {{}}
+  $eng = New-Engine
+  $culture = $eng.RecognizerInfo.Culture
+  # Default rejection (~90) drops short words; 20 (old) let noise through.
+  try {{ $eng.UpdateRecognizerSetting('CFGConfidenceRejectionThreshold', 45) }} catch {{}}
 
-  $gb = New-Object System.Speech.Recognition.GrammarBuilder
-  $gb.Culture = $culture
   $choices = New-Object System.Speech.Recognition.Choices
-  foreach ($w in @('{wake}','hay','hey','hi','hey nova','hey there','hi nova','okay hey','hi there')) {{
-    $choices.Add($w)
-  }}
-  $gb.Append($choices)
-  $kw = New-Object System.Speech.Recognition.Grammar($gb)
-  $kw.Name = 'wake'
-  $eng.LoadGrammar($kw)
+  foreach ($w in @({list})) {{ $choices.Add($w) }}
 
-  # Light dictation backup — catches "hey …" when keyword grammar misses.
-  $dict = New-Object System.Speech.Recognition.DictationGrammar
-  $dict.Name = 'dict'
-  try {{ $dict.Weight = 0.35 }} catch {{}}
-  $eng.LoadGrammar($dict)
+  $gbWake = New-Object System.Speech.Recognition.GrammarBuilder
+  $gbWake.Culture = $culture
+  $gbWake.Append($choices)
+  $gWake = New-Object System.Speech.Recognition.Grammar($gbWake)
+  $gWake.Name = 'wake'
+  $eng.LoadGrammar($gWake)
 
-  $eng.InitialSilenceTimeout = [TimeSpan]::FromSeconds(2.5)
-  $eng.BabbleTimeout = [TimeSpan]::FromSeconds(1.5)
-  $eng.EndSilenceTimeout = [TimeSpan]::FromSeconds(0.45)
+  $gbCmd = New-Object System.Speech.Recognition.GrammarBuilder
+  $gbCmd.Culture = $culture
+  $gbCmd.Append($choices)
+  $gbCmd.AppendDictation()
+  $gCmd = New-Object System.Speech.Recognition.Grammar($gbCmd)
+  $gCmd.Name = 'wakecmd'
+  $eng.LoadGrammar($gCmd)
 
+  $eng.InitialSilenceTimeout = [TimeSpan]::FromSeconds(4)
+  $eng.BabbleTimeout = [TimeSpan]::FromSeconds(4)
+  $eng.EndSilenceTimeout = [TimeSpan]::FromSeconds(0.6)
+  [Console]::Out.WriteLine('READY'); [Console]::Out.Flush()
+
+  $minConf = {min_conf}
   $deadline = (Get-Date).AddMinutes(8)
   while ((Get-Date) -lt $deadline) {{
-    $result = $eng.Recognize([TimeSpan]::FromSeconds(4))
-    if ($null -eq $result) {{ continue }}
-    $t = $result.Text.Trim().ToLowerInvariant()
-    if (
-      $t -match '\bhey\b' -or
-      $t -match '\bhay\b' -or
-      $t -match '\bhi\b' -or
-      $t -eq '{wake}' -or
-      $t.StartsWith('hey') -or
-      $t.StartsWith('hay') -or
-      $t.StartsWith('hi')
-    ) {{
-      Write-Output 'hey'
+    $r = $eng.Recognize([TimeSpan]::FromSeconds(6))
+    if ($null -eq $r -or $r.Words.Count -eq 0) {{ continue }}
+    $first = $r.Words[0]
+    if ($first.Text.ToLowerInvariant() -ne '{head}') {{ continue }}
+    if ($r.Grammar.Name -eq 'wake') {{
+      if ($r.Confidence -lt $minConf) {{ continue }}
+      [Console]::Out.WriteLine('WAKE'); [Console]::Out.Flush()
+      # Same warm engine → dictation right away so the first words aren't lost.
+      $eng.UnloadAllGrammars()
+      $eng.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))
+      $eng.InitialSilenceTimeout = [TimeSpan]::FromSeconds(6)
+      $eng.BabbleTimeout = [TimeSpan]::FromSeconds(8)
+      $eng.EndSilenceTimeout = [TimeSpan]::FromSeconds(1.1)
+      $c = $eng.Recognize([TimeSpan]::FromSeconds({command_secs}))
+      if ($null -ne $c -and -not [string]::IsNullOrWhiteSpace($c.Text)) {{
+        [Console]::Out.WriteLine('TEXT:' + $c.Text.Trim())
+      }} else {{
+        [Console]::Out.WriteLine('TEXT:')
+      }}
+      [Console]::Out.Flush()
       exit 0
     }}
+    # "hey <dictation>": judge the wake word itself, not the free text after it.
+    if ($first.Confidence -lt $minConf -or $r.Words.Count -lt 2) {{ continue }}
+    [Console]::Out.WriteLine('WAKE')
+    [Console]::Out.WriteLine('TEXT:' + $r.Text.Trim())
+    [Console]::Out.Flush()
+    exit 0
   }}
-  Write-Output ''
   exit 1
 }} catch {{
   [Console]::Error.WriteLine($_.Exception.Message)
   exit 2
 }}
-"#,
-        wake = wake_esc
-    );
+"#
+    )
+}
 
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("grok-wake-{stamp}.ps1"));
-    fs::write(&path, &script).map_err(|e| format!("Could not write wake script: {e}"))?;
-    if let Ok(mut slot) = state.wake_script.lock() {
-        *slot = Some(path.clone());
+/// Arms the offline wake listener. Resolves with `status: "wake"` (+ the command
+/// text heard right after it), `"timeout"` after ~8 min of silence, or
+/// `"cancelled"` when `stt_cancel_wake` / a newer call replaced it.
+/// Engine / mic failures are returned as `Err` so the caller can back off.
+#[tauri::command]
+pub async fn stt_wait_wake_word(
+    app: AppHandle,
+    word: Option<String>,
+    name: Option<String>,
+    min_confidence: Option<f32>,
+    state: State<'_, Arc<SttState>>,
+) -> Result<WakeOutcome, String> {
+    not_windows()?;
+    let st = Arc::clone(&*state);
+    // Never stack exclusive mic holders.
+    proc::kill_slot(&st.wake_pid);
+    let gen = st.wake_gen.fetch_add(1, Ordering::SeqCst) + 1;
+
+    let mut wake = sanitize_phrase(word.as_deref().unwrap_or("hey"));
+    if wake.is_empty() {
+        wake = "hey".into();
     }
+    let head = wake.split(' ').next().unwrap_or("hey").to_string();
+    let mut phrases = vec![wake.clone()];
+    let name = sanitize_phrase(name.as_deref().unwrap_or(""));
+    if !name.is_empty() && !wake.ends_with(&name) {
+        phrases.push(format!("{wake} {name}"));
+    }
+    let min_conf = min_confidence.unwrap_or(0.6).clamp(0.3, 0.95);
+    let script = wake_script(&phrases, &head.replace('\'', "''"), min_conf, 10);
 
-    let path_str = path.to_string_lossy().to_string();
-    let wake_pid = Arc::clone(&state.wake_pid);
-
-    let (code, stdout, stderr) = tauri::async_runtime::spawn_blocking(move || {
-        let mut child = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                &path_str,
-            ])
+    let st2 = Arc::clone(&st);
+    let app2 = app.clone();
+    let (code, text, heard, stderr) = tauri::async_runtime::spawn_blocking(move || {
+        let path = proc::temp_file("wake", "ps1");
+        std::fs::write(&path, &script).map_err(|e| format!("Could not write wake script: {e}"))?;
+        let _guard = proc::TempFile(path.clone());
+        let mut child = proc::command("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("Could not start wake listener: {e}"))?;
+        let pid = child.id();
+        st2.wake_pid.store(pid, Ordering::SeqCst);
+        if st2.wake_gen.load(Ordering::SeqCst) != gen {
+            // stt_cancel_wake raced the spawn (e.g. TTS started) — don't hold the mic.
+            proc::kill_tree(pid);
+        }
 
-        wake_pid.store(child.id(), Ordering::SeqCst);
-        let output = child
-            .wait_with_output()
-            .map_err(|e| format!("Wake listener failed: {e}"))?;
-        wake_pid.store(0, Ordering::SeqCst);
-
-        let _ = fs::remove_file(&path_str);
-        let code = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Ok::<_, String>((code, stdout, stderr))
+        let err_handle = child.stderr.take().map(|mut e| {
+            std::thread::spawn(move || {
+                let mut b = String::new();
+                let _ = std::io::Read::read_to_string(&mut e, &mut b);
+                b
+            })
+        });
+        let mut heard = false;
+        let mut text = String::new();
+        if let Some(out) = child.stdout.take() {
+            for line in BufReader::new(out).lines() {
+                let Ok(line) = line else { break };
+                let line = line.trim();
+                if line == "READY" {
+                    let _ = app2.emit("stt-wake-ready", ());
+                } else if line == "WAKE" {
+                    heard = true;
+                    let _ = app2.emit("stt-wake", ());
+                } else if let Some(rest) = line.strip_prefix("TEXT:") {
+                    text = rest.trim().to_string();
+                }
+            }
+        }
+        let status = child.wait();
+        let _ = st2
+            .wake_pid
+            .compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+        let stderr = err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+        let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
+        Ok::<_, String>((code, text, heard, stderr.trim().to_string()))
     })
     .await
     .map_err(|e| format!("Wake-word task failed: {e}"))??;
 
-    if let Ok(mut slot) = state.wake_script.lock() {
-        *slot = None;
+    if st.wake_gen.load(Ordering::SeqCst) != gen {
+        return Ok(WakeOutcome {
+            status: "cancelled".into(),
+            text: String::new(),
+        });
     }
-
-    if code == 2 {
-        return Err(format!(
-            "Wake word failed: {}",
-            if stderr.is_empty() {
-                "unknown"
-            } else {
-                &stderr
-            }
-        ));
+    if heard {
+        return Ok(WakeOutcome {
+            status: "wake".into(),
+            text,
+        });
     }
-    if stdout == "hey" {
-        Ok("hey".into())
-    } else {
-        Err("Wake-word listen timed out.".into())
+    if code == 1 {
+        return Ok(WakeOutcome {
+            status: "timeout".into(),
+            text: String::new(),
+        });
     }
+    Err(format!(
+        "Wake word listener failed: {}",
+        if stderr.is_empty() {
+            format!("exit {code}")
+        } else {
+            stderr.chars().take(240).collect()
+        }
+    ))
 }
 
 #[tauri::command]
-pub fn stt_cancel_wake(state: State<'_, SttState>) -> Result<(), String> {
-    kill_pid(state.wake_pid.swap(0, Ordering::SeqCst));
-    if let Ok(mut slot) = state.wake_script.lock() {
-        if let Some(path) = slot.take() {
-            let _ = fs::remove_file(path);
-        }
+pub async fn stt_cancel_wake(state: State<'_, Arc<SttState>>) -> Result<(), String> {
+    let st = Arc::clone(&*state);
+    st.wake_gen.fetch_add(1, Ordering::SeqCst);
+    tauri::async_runtime::spawn_blocking(move || proc::kill_slot(&st.wake_pid))
+        .await
+        .map_err(|e| format!("cancel failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_phrase;
+
+    #[test]
+    fn sanitizes_wake_words() {
+        assert_eq!(sanitize_phrase("  Hey   NOVA!! "), "hey nova");
+        assert_eq!(sanitize_phrase("hey'; rm"), "hey' rm");
     }
-    Ok(())
 }

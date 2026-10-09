@@ -49,17 +49,44 @@ export interface RecognitionHandle {
   abort: () => void;
 }
 
-/** Offline Windows dictation (System.Speech) — no network. */
+/** Offline Windows dictation (System.Speech) — no network. Cancel with cancelListenWindows(). */
 export async function listenWindowsOffline(timeoutSecs = 8): Promise<string> {
   return invoke<string>("stt_listen_windows", { timeoutSecs });
 }
 
-/** Blocks until wake word (default "hey") via Windows offline speech. */
-export async function waitWakeWord(word = "hey"): Promise<string> {
-  return invoke<string>("stt_wait_wake_word", { word });
+/** Kill an in-flight offline listen (tap-to-talk cancel). */
+export async function cancelListenWindows(): Promise<void> {
+  try {
+    await invoke("stt_cancel_listen");
+  } catch {
+    // ignore
+  }
 }
 
-/** Stop the background wake-word PowerShell so tap-to-talk can own the mic. */
+export interface WakeOutcome {
+  status: "wake" | "timeout" | "cancelled";
+  /** What was said right after the wake word (same warm recognizer). */
+  text: string;
+}
+
+/**
+ * Arms the offline wake listener ("hey" / "hey <name>"). Resolves on wake,
+ * timeout or cancel; rejects on engine/mic errors (caller backs off).
+ * The backend also emits `stt-wake` the instant the wake word is heard.
+ */
+export async function waitWakeWord(opts: {
+  word?: string;
+  name?: string;
+  minConfidence?: number;
+} = {}): Promise<WakeOutcome> {
+  return invoke<WakeOutcome>("stt_wait_wake_word", {
+    word: opts.word ?? "hey",
+    name: opts.name ?? null,
+    minConfidence: opts.minConfidence ?? null,
+  });
+}
+
+/** Stop the background wake-word PowerShell so tap-to-talk / TTS can own the audio. */
 export async function cancelWakeWord(): Promise<void> {
   try {
     await invoke("stt_cancel_wake");
@@ -68,15 +95,45 @@ export async function cancelWakeWord(): Promise<void> {
   }
 }
 
+let ackCtx: AudioContext | null = null;
+/** Tiny soft two-note blip so the user knows she's listening (no asset needed). */
+export function playAck(): void {
+  try {
+    const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!Ctx) return;
+    ackCtx = ackCtx ?? new Ctx();
+    const ctx = ackCtx;
+    if (ctx.state === "suspended") void ctx.resume();
+    const now = ctx.currentTime;
+    for (const [i, freq] of [660, 880].entries()) {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      const t0 = now + i * 0.07;
+      gain.gain.setValueAtTime(0, t0);
+      gain.gain.linearRampToValueAtTime(0.06, t0 + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.12);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.13);
+    }
+  } catch {
+    // audio is optional
+  }
+}
+
 /** Microsoft Edge neural TTS — sounds like a real person (needs network). */
 /** Default: Yan (HK) — East Asian teen/young woman speaking English. */
 export const DEFAULT_NEURAL_VOICE = "en-HK-YanNeural";
 
+/** Resolves "done" when playback finished, "stopped" when cut off by tts_stop / a newer utterance. */
 export async function speakNatural(
   text: string,
   voice = DEFAULT_NEURAL_VOICE,
-): Promise<void> {
-  await invoke("tts_speak_natural", { text, voice });
+): Promise<"done" | "stopped"> {
+  const r = await invoke<string>("tts_speak_natural", { text, voice });
+  return r === "stopped" ? "stopped" : "done";
 }
 
 export async function stopNaturalSpeaking(): Promise<void> {
@@ -92,12 +149,13 @@ export function startRecognition(opts: {
   onStart?: () => void;
   onInterim?: (text: string) => void;
   onFinal?: (text: string) => void;
-  onError?: (message: string) => void;
+  /** `code` is the raw SpeechRecognition error ("network", "not-allowed", …). */
+  onError?: (message: string, code: string) => void;
   onEnd?: () => void;
 }): RecognitionHandle | null {
   const Ctor = getSpeechRecognitionCtor();
   if (!Ctor) {
-    opts.onError?.("No cloud speech in this WebView — use Windows offline mic or type.");
+    opts.onError?.("No cloud speech in this WebView — use Windows offline mic or type.", "unsupported");
     return null;
   }
 
@@ -129,14 +187,14 @@ export function startRecognition(opts: {
       aborted: "Listening cancelled.",
     };
     const message = map[ev.error] ?? `Speech error: ${ev.error}`;
-    if (ev.error !== "aborted") opts.onError?.(message);
+    if (ev.error !== "aborted") opts.onError?.(message, ev.error);
   };
   rec.onend = () => opts.onEnd?.();
 
   try {
     rec.start();
   } catch (err) {
-    opts.onError?.(err instanceof Error ? err.message : "Could not start microphone.");
+    opts.onError?.(err instanceof Error ? err.message : "Could not start microphone.", "start-failed");
     return null;
   }
 
@@ -172,9 +230,10 @@ export function speak(text: string, opts?: { voice?: SpeechSynthesisVoice | null
   return utter;
 }
 
-export function stopSpeaking() {
+/** Stop Web Speech + kill the natural-voice player. Await it before starting a new utterance. */
+export async function stopSpeaking(): Promise<void> {
   if (speechSynthesisAvailable()) {
     window.speechSynthesis.cancel();
   }
-  void stopNaturalSpeaking();
+  await stopNaturalSpeaking();
 }
