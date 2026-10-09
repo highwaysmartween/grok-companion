@@ -9,11 +9,13 @@ import {
   listVoices,
   pickVoice,
   playAck,
+  playMp3,
   speak as speakRaw,
   speakNatural,
   speechSynthesisAvailable,
   startRecognition,
   stopSpeaking,
+  synthNatural,
   waitWakeWord,
 } from "./speech";
 
@@ -28,7 +30,11 @@ export interface UseVoiceOptions {
   voice?: string;
   /** The wake word was just heard (before the command is transcribed). */
   onWake?: () => void;
+  /** Her voice actually started playing (latency tracking). */
+  onAudioStart?: () => void;
 }
+
+type QItem = { id: number; text: string; bytes: Promise<ArrayBuffer | null> };
 
 /** Browser SpeechRecognition errors that mean "this engine won't work here" → use offline Windows STT. */
 const BROWSER_STT_FATAL = new Set(["network", "not-allowed", "service-not-allowed", "language-not-supported", "unsupported", "start-failed", "audio-capture"]);
@@ -39,7 +45,7 @@ const BROWSER_STT_FATAL = new Set(["network", "not-allowed", "service-not-allowe
  */
 const IS_WINDOWS = typeof navigator !== "undefined" && /windows/i.test(navigator.userAgent);
 /** Don't re-arm the wake listener until her own voice has fully died away. */
-const SPEECH_TAIL_MS = 700;
+const SPEECH_TAIL_MS = 500;
 const WAKE_BACKOFF_MIN_MS = 1_000;
 const WAKE_BACKOFF_MAX_MS = 30_000;
 
@@ -86,7 +92,7 @@ export function useVoice(opts: UseVoiceOptions) {
   /** Bumped on every stop/replace: stale runners never touch `speaking`. */
   const speakEpoch = useRef(0);
   const nextUtterId = useRef(0);
-  const queueRef = useRef<{ id: number; text: string }[]>([]);
+  const queueRef = useRef<QItem[]>([]);
   const playingIdRef = useRef<number | null>(null);
   const speakingRef = useRef(false);
   const quietUntilRef = useRef(0);
@@ -118,8 +124,29 @@ export function useVoice(opts: UseVoiceOptions) {
     return () => window.speechSynthesis.removeEventListener("voiceschanged", load);
   }, []);
 
-  const speakOne = useCallback(async (text: string, epoch: number) => {
+  /** Start synthesising right away so the next sentence is ready when this one ends. */
+  const prefetch = useCallback((text: string): Promise<ArrayBuffer | null> => {
+    const p = synthNatural(text, optsRef.current.voice || DEFAULT_NEURAL_VOICE).catch((err) => {
+      console.warn("[voice] synth failed:", errText(err));
+      return null;
+    });
+    return p;
+  }, []);
+
+  const speakOne = useCallback(async (item: QItem, epoch: number) => {
+    const text = item.text;
     let naturalErr = "";
+    const bytes = await item.bytes;
+    if (epoch !== speakEpoch.current) return;
+    if (bytes && bytes.byteLength > 0) {
+      try {
+        await playMp3(bytes, () => optsRef.current.onAudioStart?.());
+        return;
+      } catch (err) {
+        console.warn("[voice] webview playback failed, using system player:", errText(err));
+        if (epoch !== speakEpoch.current) return;
+      }
+    }
     try {
       await speakNatural(text, optsRef.current.voice || DEFAULT_NEURAL_VOICE);
       return;
@@ -157,7 +184,7 @@ export function useVoice(opts: UseVoiceOptions) {
       const item = queueRef.current.shift()!;
       playingIdRef.current = item.id;
       setSpeakingState(true);
-      await speakOne(item.text, epoch);
+      await speakOne(item, epoch);
       if (playingIdRef.current === item.id) playingIdRef.current = null;
     }
     // Only the runner of the live epoch, with nothing queued or playing, may end speaking.
@@ -204,7 +231,7 @@ export function useVoice(opts: UseVoiceOptions) {
       const idle = playingIdRef.current === null && queueRef.current.length === 0;
       if (mode === "replace" || idle) {
         const epoch = ++speakEpoch.current;
-        queueRef.current = [{ id, text: clean }];
+        queueRef.current = [{ id, text: clean, bytes: prefetch(clean) }];
         const wasPlaying = playingIdRef.current !== null;
         playingIdRef.current = null;
         setSpeakingState(true);
@@ -215,14 +242,14 @@ export function useVoice(opts: UseVoiceOptions) {
           if (epoch === speakEpoch.current) await pump(epoch);
         })();
       } else {
-        queueRef.current.push({ id, text: clean });
+        queueRef.current.push({ id, text: clean, bytes: prefetch(clean) });
         void pump(speakEpoch.current);
       }
       // She shouldn't hear herself: `speaking` is already true (wake loop won't
       // re-arm) — now free the mic from any armed wake listener.
       void cancelWakeWord();
     },
-    [pump, setSpeakingState, stopListen],
+    [pump, prefetch, setSpeakingState, stopListen],
   );
 
   const runOfflineListen = useCallback((gen: number) => {

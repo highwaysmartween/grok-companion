@@ -1,5 +1,7 @@
 import { useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, currentMonitor, primaryMonitor } from "@tauri-apps/api/window";
+import type { FlashMode } from "./flash";
 import type { PetMood } from "../../types";
 import { CompanionVRM, PET_VRM_VERSION, type GestureCue } from "./CompanionVRM";
 import type { RoamAmount, RoamDriver, Room } from "./behaviour";
@@ -22,6 +24,10 @@ interface Props {
   cue?: GestureCue | null;
   /** Settings → "Playful (jump on icons)". */
   playful?: boolean;
+  /** Her size (0.5 – 2). */
+  scale?: number;
+  /** Reports what the flash can do on the loaded model. */
+  onFlashMode?: (modelUrl: string, mode: FlashMode) => void;
 }
 
 /** ~30 Hz window moves — smooth enough, far cheaper than per-rAF IPC. */
@@ -72,8 +78,8 @@ function createWindowRoamDriver(): RoamDriver {
     inflight = true;
     lastSentAt = now;
     try {
-      const { PhysicalPosition } = await import("@tauri-apps/api/dpi");
-      await getCurrentWindow().setPosition(new PhysicalPosition(px, py));
+      // Rust moves the window and repaints whatever she uncovered (no ghost trail).
+      await invoke("pet_set_bounds", { x: px, y: py });
       lastSentX = px;
       lastSentY = py;
     } catch {
@@ -107,8 +113,9 @@ function createWindowRoamDriver(): RoamDriver {
         const margin = 4;
         minX = workX + margin;
         maxX = workX + workW - winW - margin;
-        // Feet on the taskbar: window bottom = work-area bottom.
-        floorY = Math.max(workY, workY + workH - winH);
+        // Walk along whatever height he left her at (dragged up = stays up);
+        // only lift her back if she's hanging below the taskbar.
+        floorY = Math.min(startY, Math.max(workY, workY + workH - winH));
         if (maxX <= minX) return null;
         beganAt = 0;
         lastSentX = Math.round(startX * scale);
@@ -130,6 +137,12 @@ function createWindowRoamDriver(): RoamDriver {
       // Flush the final position (already queued by the last moveTo), then stop.
       if (active && wantX != null && !timer && !inflight) void pump();
       active = false;
+      window.setTimeout(() => {
+        void getCurrentWindow()
+          .outerPosition()
+          .then((p) => invoke("pet_save_position", { x: p.x, y: p.y }))
+          .catch(() => undefined);
+      }, 400);
     },
   };
 }
@@ -137,7 +150,6 @@ function createWindowRoamDriver(): RoamDriver {
 /** Drop the window onto the bottom of the current work area (keeps X, clamps into view). */
 export async function snapToFloor(): Promise<void> {
   try {
-    const { LogicalPosition } = await import("@tauri-apps/api/dpi");
     const win = getCurrentWindow();
     const monitor = (await currentMonitor()) ?? (await primaryMonitor());
     if (!monitor) return;
@@ -152,7 +164,7 @@ export async function snapToFloor(): Promise<void> {
     const winH = size.height / scale;
     const x = Math.min(Math.max(outer.x / scale, workX), Math.max(workX, workX + workW - winW));
     const y = Math.max(workY, workY + workH - winH);
-    await win.setPosition(new LogicalPosition(Math.round(x), Math.round(y)));
+    await invoke("pet_set_bounds", { x: Math.round(x * scale), y: Math.round(y * scale) });
   } catch {
     // browser preview
   }
@@ -170,6 +182,8 @@ export function Companion({
   reactKey = 0,
   cue = null,
   playful = false,
+  scale = 1,
+  onFlashMode,
 }: Props) {
   const driverRef = useRef<RoamDriver | null>(null);
   if (!driverRef.current) driverRef.current = createWindowRoamDriver();
@@ -185,7 +199,7 @@ export function Companion({
           <div className="orbit orbit-b" />
         </>
       )}
-      <div className="pet-3d-wrap">
+      <div className="pet-3d-wrap" style={compact ? { width: Math.round(400 * scale), height: Math.round(580 * scale) } : undefined}>
         <CompanionVRM
           key={`${PET_VRM_VERSION}-${modelUrl ?? "default"}`}
           mood={mood}
@@ -199,6 +213,7 @@ export function Companion({
           cue={cue}
           playful={playful}
           roamDriver={driverRef}
+          onFlashMode={onFlashMode}
         />
       </div>
       {!compact && <div className="nametag">{name}</div>}

@@ -8,13 +8,18 @@ export type MemoryIntent =
 
 const REMEMBER = /^(?:please\s+)?(?:remember|save(?:\s+this)?(?:\s+fact)?|don't forget)(?:\s+that)?\s+[:\-–]?\s*(.+)$/i;
 const LIST =
-  /^(?:please\s+)?(?:list(?:\s+your)?\s+memories|what do you remember|show(?:\s+me)?(?:\s+your)?\s+memories|what do you know about me)\??$/i;
+  /^(?:please\s+)?(?:list(?:\s+your)?\s+memories|what do you remember(?:\s+about\s+me)?|what have you remembered(?:\s+about\s+me)?|show(?:\s+me)?(?:\s+your)?\s+memories|what do you know about me|what(?:'s| is) in your memory|tell me what you (?:remember|know) about me)\s*[?.!]*$/i;
 const FORGET =
   /^(?:please\s+)?(?:forget|delete memory|don't remember|erase)\s+(?:that\s+|the\s+fact\s+)?(.+)$/i;
 const CLEAR = /^(?:please\s+)?(?:forget everything|clear(?:\s+your)?\s+memory|wipe memories)$/i;
 
 export function parseMemoryIntent(text: string): MemoryIntent | null {
-  const t = text.trim();
+  const t = text
+    .trim()
+    .replace(/^(?:hey|ok|okay|yo)\b[\s,]*(?:nova\b[\s,]*)?/i, "")
+    .replace(/^nova\b[\s,]*/i, "")
+    .replace(/^(?:can you|could you)\s+/i, "")
+    .trim();
   if (!t) return null;
   if (CLEAR.test(t)) return { kind: "clear" };
   if (LIST.test(t)) return { kind: "list" };
@@ -106,13 +111,14 @@ export async function handleMemoryIntent(intent: MemoryIntent): Promise<string> 
     }
     case "list": {
       const facts = await listMemories();
-      if (facts.length === 0) return "My pockets are empty. Tell me something to remember.";
-      const lines = facts.map((f, i) => `${i + 1}. ${f.fact}`).join("\n");
-      return `Here's what I remember:\n${lines}`;
+      if (facts.length === 0) return "Honestly? Nothing yet. Tell me stuff and I'll keep it.";
+      const spoken = facts.slice(-10).map((f) => toSecondPerson(f.fact));
+      const list = spoken.length === 1 ? spoken[0] : `${spoken.slice(0, -1).join(", ")}, and ${spoken[spoken.length - 1]}`;
+      return `I remember ${list}.${facts.length > 10 ? ` Plus ${facts.length - 10} older things.` : ""}`;
     }
     case "forget": {
       const before = await listMemories();
-      const needle = intent.needle.toLowerCase();
+      const needle = intent.needle.toLowerCase().replace(/^(?:that|about|the fact that)\s+/, "").replace(/^(?:i|my)\s+/, "").replace(/[.!?]+$/, "");
       const match =
         before.find((f) => f.id === intent.needle) ??
         before.find((f) => f.fact.toLowerCase().includes(needle));
@@ -125,4 +131,17 @@ export async function handleMemoryIntent(intent: MemoryIntent): Promise<string> 
       return "All local memories are gone.";
     }
   }
+}
+
+const VERBS: Record<string, string> = {
+  likes: "like", loves: "love", hates: "hate", enjoys: "enjoy", lives: "live", works: "work", has: "have",
+  is: "are", wants: "want", plays: "play", watches: "watch", prefers: "prefer", needs: "need", goes: "go", was: "were",
+};
+
+/** "Frank's sister is Mia" → "your sister is Mia"; "User likes jazz" → "you like jazz". */
+export function toSecondPerson(fact: string): string {
+  let f = fact.trim().replace(/[.]+$/, "");
+  f = f.replace(/^(?:User|Frank)'s\b/i, "your").replace(/^(?:User|Frank)\s+(\w+)/i, (_, v: string) => `you ${VERBS[v.toLowerCase()] ?? v}`);
+  f = f.replace(/\b(?:Frank|the user)'s\b/gi, "your").replace(/\b(?:Frank|the user)\b/gi, "you");
+  return f.charAt(0).toLowerCase() + f.slice(1);
 }

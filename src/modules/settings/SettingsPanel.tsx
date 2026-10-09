@@ -38,9 +38,14 @@ interface Props {
   /** Wipes the on-screen / stored conversation (memories are separate). */
   onClearChat: () => void;
   chatCount: number;
+  /** Credit line for the selected character (shown when its licence requires one). */
+  credit?: string | null;
+  /** Live size preview while dragging the slider. */
+  onScalePreview?: (scale: number) => void;
 }
 
-export function SettingsPanel({ settings, models, onClose, onSaved, onClearChat, chatCount }: Props) {
+export function SettingsPanel({ settings, models, onClose, onSaved, onClearChat, chatCount, credit, onScalePreview }: Props) {
+  const [petScale, setPetScale] = useState(settings.petScale || 1);
   const [apiKey, setApiKey] = useState("");
   const [name, setName] = useState(settings.companionName);
   const [model, setModel] = useState(settings.model);
@@ -93,6 +98,7 @@ export function SettingsPanel({ settings, models, onClose, onSaved, onClearChat,
         roamAmount,
         wakeWordEnabled,
         playful,
+        petScale,
       });
       autostartIsEnabled().then(setAutostartOs).catch(() => undefined);
       if (apiKey.trim()) {
@@ -130,10 +136,28 @@ export function SettingsPanel({ settings, models, onClose, onSaved, onClearChat,
       <form className="settings-card" onSubmit={save}>
         <header>
           <h2>Settings</h2>
-          <button type="button" className="x" onClick={onClose} aria-label="Close">
-            ×
+          <button type="button" className="x" onClick={onClose} aria-label="Close settings" title="Close (Esc)">
+            ✕
           </button>
         </header>
+
+        <label>
+          Size — {Math.round(petScale * 100)}%
+          <input
+            type="range"
+            min={0.5}
+            max={2}
+            step={0.05}
+            value={petScale}
+            onChange={(e) => {
+              const v = parseFloat(e.target.value);
+              setPetScale(v);
+              onScalePreview?.(v);
+            }}
+          />
+          <span className="fine">Tip: scroll the mouse wheel over her to resize, drag her to move her.</span>
+        </label>
+        {credit && <p className="fine credit">Character: {credit}</p>}
 
         <label>
           Companion name

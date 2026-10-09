@@ -136,6 +136,101 @@ export async function speakNatural(
   return r === "stopped" ? "stopped" : "done";
 }
 
+/** v1.2: synthesize one sentence (warm edge-tts helper) → mp3 bytes, played in the webview. */
+export async function synthNatural(text: string, voice = DEFAULT_NEURAL_VOICE): Promise<ArrayBuffer> {
+  return invoke<ArrayBuffer>("tts_synth", { text, voice });
+}
+
+let liveAudio: HTMLAudioElement | null = null;
+let liveAudioDone: (() => void) | null = null;
+
+/** Play mp3 bytes; resolves when finished or stopped. Rejects if the webview can't play it. */
+export function playMp3(bytes: ArrayBuffer, onStart?: () => void): Promise<"done" | "stopped"> {
+  stopMp3();
+  const url = URL.createObjectURL(new Blob([bytes], { type: "audio/mpeg" }));
+  const audio = new Audio(url);
+  audio.preload = "auto";
+  liveAudio = audio;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (r: "done" | "stopped") => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(watchdog);
+      URL.revokeObjectURL(url);
+      if (liveAudio === audio) {
+        liveAudio = null;
+        liveAudioDone = null;
+      }
+      resolve(r);
+    };
+    liveAudioDone = () => finish("stopped");
+    // Never let a lost "ended" pin her in Speaking… (2 min hard cap per sentence).
+    const watchdog = window.setTimeout(() => finish("done"), 120_000);
+    audio.onended = () => finish("done");
+    audio.onerror = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(watchdog);
+      URL.revokeObjectURL(url);
+      reject(new Error("webview audio error"));
+    };
+    audio.onplaying = () => onStart?.();
+    audio.play().catch((err) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(watchdog);
+      URL.revokeObjectURL(url);
+      reject(err instanceof Error ? err : new Error(String(err)));
+    });
+  });
+}
+
+export function stopMp3(): void {
+  const a = liveAudio;
+  const done = liveAudioDone;
+  liveAudio = null;
+  liveAudioDone = null;
+  if (a) {
+    try {
+      a.pause();
+      a.removeAttribute("src");
+    } catch {
+      // ignore
+    }
+  }
+  done?.();
+}
+
+/** Soft three-note chime for alarms / timers (WebAudio, no asset). */
+export function playChime(repeats = 3): void {
+  try {
+    const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!Ctx) return;
+    ackCtx = ackCtx ?? new Ctx();
+    const ctx = ackCtx;
+    if (ctx.state === "suspended") void ctx.resume();
+    const now = ctx.currentTime;
+    for (let r = 0; r < repeats; r++) {
+      for (const [i, freq] of [784, 988, 1319].entries()) {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        const t0 = now + r * 1.1 + i * 0.16;
+        gain.gain.setValueAtTime(0, t0);
+        gain.gain.linearRampToValueAtTime(0.18, t0 + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.6);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(t0);
+        osc.stop(t0 + 0.62);
+      }
+    }
+  } catch {
+    // audio is optional
+  }
+}
+
 export async function stopNaturalSpeaking(): Promise<void> {
   try {
     await invoke("tts_stop");
@@ -232,6 +327,7 @@ export function speak(text: string, opts?: { voice?: SpeechSynthesisVoice | null
 
 /** Stop Web Speech + kill the natural-voice player. Await it before starting a new utterance. */
 export async function stopSpeaking(): Promise<void> {
+  stopMp3();
   if (speechSynthesisAvailable()) {
     window.speechSynthesis.cancel();
   }

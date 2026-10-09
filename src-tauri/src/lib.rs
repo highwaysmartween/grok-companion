@@ -3,22 +3,26 @@ mod memory;
 mod proc;
 mod settings;
 mod stt;
+mod tools;
 mod tts;
+mod window;
 
 // The old inject.rs (typing into other windows) was removed in v1.1.1 — the
 // companion deliberately has no PC-control surface.
 
-use grok::{cancel_chat, chat_stream, check_connection, list_models, GrokState};
-use memory::{memory_clear, memory_delete, memory_list, memory_remember};
+use grok::{cancel_chat, chat_stream, check_connection, list_models, memory_digest, GrokState};
+use memory::{memory_add_many, memory_clear, memory_delete, memory_list, memory_remember};
+use tools::{alarm_add, alarm_cancel, alarm_list, log_latency, open_target, web_search, ToolsState};
+use window::{pet_hide, pet_repaint_behind, pet_set_bounds};
 use serde::Serialize;
-use settings::{clear_api_key, get_settings, save_api_key, save_settings};
+use settings::{clear_api_key, get_settings, pet_save_position, save_api_key, save_settings};
 use std::sync::Arc;
 use stt::{stt_cancel_listen, stt_cancel_wake, stt_listen_windows, stt_wait_wake_word, SttState};
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
-use tts::{tts_default_voice, tts_speak_natural, tts_stop, TtsState};
+use tts::{tts_default_voice, tts_speak_natural, tts_stop, tts_synth, TtsState};
 
 /// Enable/disable launch-at-login to match the setting. Skipped in debug builds
 /// so `tauri dev` never registers the dev binary in the Run key.
@@ -84,7 +88,7 @@ fn show_main(app: &AppHandle) {
 fn toggle_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         if w.is_visible().unwrap_or(true) && !w.is_minimized().unwrap_or(false) {
-            let _ = w.hide();
+            window::hide_clean(&w);
         } else {
             show_main(app);
         }
@@ -97,9 +101,13 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let show_hide = MenuItem::with_id(app, "toggle", "Show / Hide", true, None::<&str>)?;
     let pause = CheckMenuItem::with_id(app, "pause_roam", "Pause roaming", true, !s.roam_enabled, None::<&str>)?;
     let settings_item = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
+    let size_small = MenuItem::with_id(app, "size_small", "Small", true, None::<&str>)?;
+    let size_medium = MenuItem::with_id(app, "size_medium", "Medium", true, None::<&str>)?;
+    let size_large = MenuItem::with_id(app, "size_large", "Large", true, None::<&str>)?;
+    let size = Submenu::with_items(app, "Size", true, &[&size_small, &size_medium, &size_large])?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_hide, &pause, &settings_item, &sep, &quit])?;
+    let menu = Menu::with_items(app, &[&show_hide, &pause, &size, &settings_item, &sep, &quit])?;
 
     let pause_for_events = pause.clone();
     let mut builder = TrayIconBuilder::with_id("main-tray")
@@ -119,6 +127,15 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
                 });
                 let _ = app.emit("tray-roam", !paused);
             }
+            "size_small" | "size_medium" | "size_large" => {
+                let scale: f32 = match event.id.as_ref() {
+                    "size_small" => 0.7,
+                    "size_large" => 1.4,
+                    _ => 1.0,
+                };
+                let _ = settings::update_settings(app, |s| s.pet_scale = scale);
+                let _ = app.emit("tray-scale", scale);
+            }
             "settings" => {
                 show_main(app);
                 let _ = app.emit("tray-open-settings", ());
@@ -128,10 +145,15 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
                 if let Some(st) = app.try_state::<Arc<SttState>>() {
                     proc::kill_slot(&st.wake_pid);
                     proc::kill_slot(&st.listen_pid);
+                    stt::shutdown(&st);
                 }
                 if let Some(st) = app.try_state::<Arc<TtsState>>() {
                     proc::kill_slot(&st.synth_pid);
                     proc::kill_slot(&st.play_pid);
+                    tts::shutdown(&st);
+                }
+                if let Some(w) = app.get_webview_window("main") {
+                    window::hide_clean(&w);
                 }
                 if let Some(st) = app.try_state::<Arc<GrokState>>() {
                     proc::kill_slot(&st.cli_pid);
@@ -162,6 +184,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             Some(vec!["--autostart"]),
@@ -169,6 +192,7 @@ pub fn run() {
         .manage(Arc::new(GrokState::new()))
         .manage(Arc::new(SttState::default()))
         .manage(Arc::new(TtsState::default()))
+        .manage(Arc::new(ToolsState::default()))
         .setup(|app| {
             if let Err(e) = build_tray(app) {
                 eprintln!("[tray] could not create tray icon: {e}");
@@ -177,7 +201,27 @@ pub fn run() {
             apply_autostart(app.handle(), s.autostart);
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_always_on_top(s.always_on_top);
+                // Back where he left her (only if that spot is still on a monitor).
+                if let (Some(x), Some(y)) = (s.pet_x, s.pet_y) {
+                    let on_screen = w
+                        .available_monitors()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|m| {
+                            let p = m.position();
+                            let z = m.size();
+                            x + 80 >= p.x
+                                && x + 80 < p.x + z.width as i32
+                                && y + 80 >= p.y
+                                && y + 80 < p.y + z.height as i32
+                        });
+                    if on_screen {
+                        let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
+                    }
+                }
             }
+            tools::start_scheduler(app.handle().clone(), Arc::clone(&*app.state::<Arc<ToolsState>>()));
+            tts::prewarm(Arc::clone(&*app.state::<Arc<TtsState>>()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -200,7 +244,20 @@ pub fn run() {
             tts_speak_natural,
             tts_stop,
             tts_default_voice,
+            tts_synth,
             cursor_relative,
+            memory_add_many,
+            memory_digest,
+            alarm_add,
+            alarm_list,
+            alarm_cancel,
+            open_target,
+            web_search,
+            pet_set_bounds,
+            pet_repaint_behind,
+            pet_hide,
+            pet_save_position,
+            log_latency,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

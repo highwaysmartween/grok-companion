@@ -37,6 +37,7 @@ export function toPayload(s: PublicSettings, patch: Partial<SettingsPayload> = {
     roamAmount: s.roamAmount || "calm",
     wakeWordEnabled: s.wakeWordEnabled,
     playful: !!s.playful,
+    petScale: s.petScale || 1,
     ...patch,
   };
 }

@@ -56,6 +56,11 @@ pub struct AppSettings {
     pub wake_word_enabled: bool,
     /// "Playful (jump on icons)": lets her walk over to desktop icons and pounce. Off by default.
     pub playful: bool,
+    /// Her size: 0.5 – 2.0 (window + camera scale together). v1.2.
+    pub pet_scale: f32,
+    /// Last spot he dragged / she walked to (physical px), restored at launch.
+    pub pet_x: Option<i32>,
+    pub pet_y: Option<i32>,
     /// Field-level default (0) so stores written before v1.1.1 get migrated once.
     #[serde(default)]
     pub settings_rev: u32,
@@ -83,6 +88,9 @@ impl Default for AppSettings {
             roam_amount: DEFAULT_ROAM_AMOUNT.to_string(),
             wake_word_enabled: true,
             playful: false,
+            pet_scale: 1.0,
+            pet_x: None,
+            pet_y: None,
             settings_rev: SETTINGS_REV,
         }
     }
@@ -121,6 +129,11 @@ impl AppSettings {
             self.brain_provider = "grok-cli".into();
         }
         self.max_tokens = self.max_tokens.clamp(64, 8192);
+        self.pet_scale = if self.pet_scale.is_finite() && self.pet_scale > 0.0 {
+            self.pet_scale.clamp(0.5, 2.0)
+        } else {
+            1.0
+        };
         self.temperature = self.temperature.clamp(0.0, 2.0);
         self.settings_rev = SETTINGS_REV;
         self
@@ -151,6 +164,7 @@ pub struct PublicSettings {
     pub roam_amount: String,
     pub wake_word_enabled: bool,
     pub playful: bool,
+    pub pet_scale: f32,
 }
 
 impl PublicSettings {
@@ -181,6 +195,7 @@ impl PublicSettings {
             roam_amount: settings.roam_amount,
             wake_word_enabled: settings.wake_word_enabled,
             playful: settings.playful,
+            pet_scale: settings.pet_scale,
         }
     }
 }
@@ -261,8 +276,11 @@ pub fn get_settings(app: AppHandle) -> Result<PublicSettings, String> {
 
 #[tauri::command(async)]
 pub fn save_settings(app: AppHandle, settings: AppSettings) -> Result<PublicSettings, String> {
+    let prev = load_settings(&app);
     let settings = AppSettings {
         settings_rev: SETTINGS_REV,
+        pet_x: settings.pet_x.or(prev.pet_x),
+        pet_y: settings.pet_y.or(prev.pet_y),
         ..settings
     }
     .migrate();
@@ -271,6 +289,19 @@ pub fn save_settings(app: AppHandle, settings: AppSettings) -> Result<PublicSett
     let _ = app.emit("settings-changed", ());
     let api_key = load_api_key(&app);
     Ok(PublicSettings::from_parts(settings, api_key))
+}
+
+/// Remember where she is (after a drag / stroll).
+#[tauri::command(async)]
+pub fn pet_save_position(app: AppHandle, x: i32, y: i32) -> Result<(), String> {
+    let s = load_settings(&app);
+    if s.pet_x == Some(x) && s.pet_y == Some(y) {
+        return Ok(());
+    }
+    let mut s = s;
+    s.pet_x = Some(x);
+    s.pet_y = Some(y);
+    persist(&app, &s)
 }
 
 #[tauri::command(async)]

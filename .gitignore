@@ -39,3 +39,6 @@ src-tauri/gen
 Thumbs.db
 Desktop.ini
 __pycache__/
+
+# Personal-build-only models (licence forbids redistribution) — never commit
+public/models-private/

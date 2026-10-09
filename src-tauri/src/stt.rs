@@ -15,10 +15,12 @@
 
 use crate::proc;
 use serde::Serialize;
-use std::io::{BufRead, BufReader};
-use std::process::Stdio;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{ChildStdin, Stdio};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
 #[derive(Default)]
@@ -31,6 +33,13 @@ pub struct SttState {
     pub listen_gen: AtomicU64,
     /// 0 = untested, 1 = Whisper works, 2 = Whisper unavailable (use System.Speech).
     pub whisper: AtomicU8,
+    /// Persistent Whisper helper (v1.2): model + mic stay warm between turns.
+    pub server_pid: AtomicU32,
+    server_stdin: Mutex<Option<ChildStdin>>,
+    server_rx: Mutex<Option<Receiver<String>>>,
+    server_script: Mutex<Option<proc::TempFile>>,
+    /// Serialises jobs on the single helper.
+    job_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,7 +88,7 @@ fn ps_quote(s: &str) -> String {
 const WHISPER_PY: &str = include_str!("whisper_stt.py");
 const WHISPER_UNAVAILABLE: i32 = 3;
 
-fn python_candidates() -> Vec<Vec<String>> {
+pub(crate) fn python_candidates() -> Vec<Vec<String>> {
     let mut out: Vec<Vec<String>> = Vec::new();
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         let base = std::path::PathBuf::from(local)
@@ -102,6 +111,7 @@ fn python_candidates() -> Vec<Vec<String>> {
     out
 }
 
+#[allow(dead_code)]
 fn whisper_command(args: &[String]) -> Option<(std::process::Command, proc::TempFile)> {
     let path = proc::temp_file("whisper", "py");
     std::fs::write(&path, WHISPER_PY).ok()?;
@@ -136,12 +146,228 @@ fn note_whisper(st: &SttState, code: i32, stderr: &str) {
     }
 }
 
+#[allow(dead_code)]
 /// Last `TEXT:` line of the helper's stdout.
+#[allow(dead_code)]
 fn text_line(stdout: &str) -> Option<String> {
     stdout
         .lines()
         .rev()
         .find_map(|l| l.trim().strip_prefix("TEXT:").map(|t| t.trim().to_string()))
+}
+
+
+// --- persistent Whisper helper -------------------------------------------------
+
+fn server_send(st: &SttState, line: &str) -> bool {
+    let mut g = match st.server_stdin.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    match g.as_mut() {
+        Some(w) => writeln!(w, "{line}").and_then(|_| w.flush()).is_ok(),
+        None => false,
+    }
+}
+
+fn server_reset(st: &SttState) {
+    if let Ok(mut g) = st.server_stdin.lock() {
+        *g = None;
+    }
+    if let Ok(mut g) = st.server_rx.lock() {
+        *g = None;
+    }
+    proc::kill_slot(&st.server_pid);
+}
+
+/// Start the helper if it isn't running. Err(code 3) = Whisper unavailable.
+fn ensure_server(st: &SttState) -> Result<(), (i32, String)> {
+    if st.server_pid.load(Ordering::SeqCst) != 0
+        && st.server_stdin.lock().map(|g| g.is_some()).unwrap_or(false)
+    {
+        return Ok(());
+    }
+    server_reset(st);
+    let path = proc::temp_file("whisper-serve", "py");
+    std::fs::write(&path, WHISPER_PY).map_err(|e| (2, format!("write helper: {e}")))?;
+    let launcher = python_candidates()
+        .into_iter()
+        .find(|c| {
+            let p = std::path::Path::new(&c[0]);
+            p.is_absolute() && p.is_file() || !p.is_absolute()
+        })
+        .ok_or((WHISPER_UNAVAILABLE, "no python".to_string()))?;
+    let mut cmd = proc::command(&launcher[0]);
+    cmd.args(&launcher[1..])
+        .arg("-u")
+        .arg(&path)
+        .arg("serve")
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUNBUFFERED", "1")
+        .env("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+        .env("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| (WHISPER_UNAVAILABLE, format!("spawn: {e}")))?;
+    let pid = child.id();
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    if let Some(out) = stdout {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).split(b'\n') {
+                let Ok(line) = line else { break };
+                let l = String::from_utf8_lossy(&line).trim().to_string();
+                if tx.send(l).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let err_buf = Arc::new(Mutex::new(String::new()));
+    if let Some(mut e) = stderr {
+        let eb = Arc::clone(&err_buf);
+        std::thread::spawn(move || {
+            let mut r = BufReader::new(&mut e);
+            let mut line = String::new();
+            while r.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                if let Ok(mut g) = eb.lock() {
+                    g.push_str(&line);
+                    let len = g.len();
+                    if len > 4000 {
+                        g.drain(..len - 2000);
+                    }
+                }
+                line.clear();
+            }
+        });
+    }
+    // Reap the child when it exits so the pid slot is cleared.
+    let st_pid = pid;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        let _ = tx.send(format!("EXIT {st_pid}"));
+    });
+    // First start loads the model (can take a while on a cold disk).
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(l) if l == "LOADED" => break,
+            Ok(l) if l.starts_with("EXIT ") => {
+                let err = err_buf.lock().map(|g| g.clone()).unwrap_or_default();
+                let code = if err.contains("unavailable") || err.contains("start failed") {
+                    WHISPER_UNAVAILABLE
+                } else {
+                    2
+                };
+                return Err((code, err.trim().chars().take(240).collect()));
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+            Err(_) => {
+                proc::kill_tree(pid);
+                return Err((2, "whisper helper did not start in time".into()));
+            }
+        }
+    }
+    st.server_pid.store(pid, Ordering::SeqCst);
+    if let Ok(mut g) = st.server_stdin.lock() {
+        *g = stdin;
+    }
+    if let Ok(mut g) = st.server_rx.lock() {
+        *g = Some(rx);
+    }
+    if let Ok(mut g) = st.server_script.lock() {
+        *g = Some(proc::TempFile(path));
+    }
+    Ok(())
+}
+
+struct JobResult {
+    code: i32,
+    text: String,
+    heard: bool,
+    err: String,
+}
+
+/// Run one job on the warm helper. `wanted` false → the job is cancelled.
+fn server_job(
+    st: &SttState,
+    line: &str,
+    wanted: &dyn Fn() -> bool,
+    app: Option<&AppHandle>,
+) -> Result<JobResult, (i32, String)> {
+    let _job = st.job_lock.lock().map_err(|_| (2, "stt lock".to_string()))?;
+    if !wanted() {
+        return Ok(JobResult { code: 1, text: String::new(), heard: false, err: String::new() });
+    }
+    ensure_server(st)?;
+    let rx_guard = st.server_rx.lock().map_err(|_| (2, "stt rx lock".to_string()))?;
+    let Some(rx) = rx_guard.as_ref() else {
+        return Err((2, "whisper helper not running".into()));
+    };
+    while rx.try_recv().is_ok() {}
+    if !server_send(st, line) {
+        drop(rx_guard);
+        server_reset(st);
+        return Err((2, "whisper helper stdin closed".into()));
+    }
+    let mut res = JobResult { code: 1, text: String::new(), heard: false, err: String::new() };
+    let mut cancel_deadline: Option<Instant> = None;
+    loop {
+        if cancel_deadline.is_none() && !wanted() {
+            server_send(st, "cancel");
+            cancel_deadline = Some(Instant::now() + Duration::from_secs(3));
+        }
+        if let Some(d) = cancel_deadline {
+            if Instant::now() > d {
+                drop(rx_guard);
+                server_reset(st);
+                return Ok(res);
+            }
+        }
+        match rx.recv_timeout(Duration::from_millis(80)) {
+            Ok(l) => {
+                if l == "READY" {
+                    if let Some(a) = app {
+                        let _ = a.emit("stt-wake-ready", ());
+                    }
+                } else if l == "WAKE" {
+                    res.heard = true;
+                    if let Some(a) = app {
+                        let _ = a.emit("stt-wake", ());
+                    }
+                } else if let Some(t) = l.strip_prefix("TEXT:") {
+                    res.text = t.trim().to_string();
+                } else if let Some(c) = l.strip_prefix("END ") {
+                    res.code = c.trim().parse().unwrap_or(2);
+                    return Ok(res);
+                } else if l.starts_with("EXIT ") {
+                    drop(rx_guard);
+                    server_reset(st);
+                    res.code = 2;
+                    res.err = "whisper helper exited".into();
+                    return Ok(res);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                drop(rx_guard);
+                server_reset(st);
+                res.code = 2;
+                res.err = "whisper helper gone".into();
+                return Ok(res);
+            }
+        }
+    }
+}
+
+/// Kill the helper (app quit).
+pub fn shutdown(st: &SttState) {
+    server_reset(st);
 }
 
 const ENGINE_PRELUDE: &str = r#"
@@ -226,32 +452,18 @@ pub async fn stt_listen_windows(
     let (code, stdout, stderr) = tauri::async_runtime::spawn_blocking(move || {
         let wanted = || st2.listen_gen.load(Ordering::SeqCst) == gen;
         if whisper_allowed(&st2) {
-            if let Some((cmd, _guard)) =
-                whisper_command(&["listen".into(), "--secs".into(), secs.to_string()])
-            {
-                match proc::run_tracked_checked(cmd, &st2.listen_pid, &wanted) {
-                    Ok(o) => {
-                        let code = o.status.code().unwrap_or(-1);
-                        let out = String::from_utf8_lossy(&o.stdout).to_string();
-                        let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                        note_whisper(&st2, code, &err);
-                        if code != WHISPER_UNAVAILABLE {
-                            let text = if code == 0 {
-                                text_line(&out).unwrap_or_default()
-                            } else {
-                                String::new()
-                            };
-                            return Ok((code, text, err));
-                        }
+            match server_job(&st2, &format!("listen {secs}"), &wanted, None) {
+                Ok(r) => {
+                    st2.whisper.store(1, Ordering::SeqCst);
+                    if r.code == 2 {
+                        return Ok((2, String::new(), r.err));
                     }
-                    Err(e) => {
-                        eprintln!("[stt] could not start whisper: {e}");
-                        st2.whisper.store(2, Ordering::SeqCst);
-                    }
+                    return Ok((0, r.text, String::new()));
                 }
-                if !wanted() {
-                    return Ok((0, String::new(), String::new()));
-                }
+                Err((code, err)) => note_whisper(&st2, code, &err),
+            }
+            if !wanted() {
+                return Ok((0, String::new(), String::new()));
             }
         }
         run_ps_file_tracked(&listen_script(secs), &st2.listen_pid, &wanted)
@@ -402,33 +614,25 @@ pub async fn stt_wait_wake_word(
 
     let st2 = Arc::clone(&st);
     let app2 = app.clone();
-    let whisper_args: Vec<String> = vec![
-        "wake".into(),
-        "--secs".into(),
-        "480".into(),
-        "--command-secs".into(),
-        "10".into(),
-        "--name".into(),
-        name.clone(),
-    ];
+    let whisper_line = format!("wake 480 10 {name}");
     let (code, text, heard, stderr) = tauri::async_runtime::spawn_blocking(move || {
         if whisper_allowed(&st2) {
-            if let Some((cmd, _guard)) = whisper_command(&whisper_args) {
-                match run_wake_child(cmd, &st2, gen, &app2) {
-                    Ok(r) => {
-                        note_whisper(&st2, r.0, &r.3);
-                        if r.0 != WHISPER_UNAVAILABLE || r.2 {
-                            return Ok(r);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[stt] could not start whisper wake: {e}");
-                        st2.whisper.store(2, Ordering::SeqCst);
+            let wanted = || st2.wake_gen.load(Ordering::SeqCst) == gen;
+            match server_job(&st2, &whisper_line, &wanted, Some(&app2)) {
+                Ok(r) => {
+                    st2.whisper.store(1, Ordering::SeqCst);
+                    return Ok((r.code, r.text, r.heard, r.err));
+                }
+                Err((code, err)) => {
+                    eprintln!("[stt] whisper helper failed ({code}): {err}");
+                    note_whisper(&st2, code, &err);
+                    if code != WHISPER_UNAVAILABLE {
+                        return Ok((2, String::new(), false, err));
                     }
                 }
-                if st2.wake_gen.load(Ordering::SeqCst) != gen {
-                    return Ok((0, String::new(), false, String::new()));
-                }
+            }
+            if st2.wake_gen.load(Ordering::SeqCst) != gen {
+                return Ok((0, String::new(), false, String::new()));
             }
         }
         let path = proc::temp_file("wake", "ps1");

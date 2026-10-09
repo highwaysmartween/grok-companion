@@ -20,15 +20,15 @@ pub const XAI_MODELS_URL: &str = "https://api.x.ai/v1/models";
 /// for an empty model, so the installed CLI picks its own default (grok-4.7 today).
 pub const DEFAULT_MODEL: &str = "grok-4.6";
 
-/// Max chat messages (user + assistant) forwarded to the brain per request.
-pub const MAX_HISTORY_MESSAGES: usize = 20;
+/// Max chat messages (user + assistant) forwarded to the brain per request (~12 turns).
+pub const MAX_HISTORY_MESSAGES: usize = 24;
 /// Per-message cap so one pasted wall of text can't blow the prompt budget.
 const MAX_MESSAGE_CHARS: usize = 2_000;
 /// Total conversation budget (chars). Keeps the CLI prompt file / API payload small.
-const MAX_HISTORY_CHARS: usize = 16_000;
+const MAX_HISTORY_CHARS: usize = 9_000;
 /// `--system-prompt-override` goes on the command line; Windows caps the whole
 /// command line at 32 767 chars, so keep the persona well under that.
-const MAX_SYSTEM_CHARS: usize = 6_000;
+const MAX_SYSTEM_CHARS: usize = 9_000;
 /// Legacy `-p <prompt>` fallback: whole prompt must stay well under 32k.
 const MAX_LEGACY_PROMPT_CHARS: usize = 20_000;
 
@@ -111,22 +111,49 @@ Flirt like a real person — subtle innuendo, playful challenges, owning it. Nev
     }
 }
 
-pub fn build_system_prompt(app: &AppHandle) -> String {
+/// "Saturday 10 October 2026, 12:05 AM (Pacific/Auckland, UTC+13:00)".
+pub fn now_line() -> String {
+    let now = chrono::Local::now();
+    format!(
+        "{} (Pacific/Auckland, UTC{})",
+        now.format("%A %-d %B %Y, %-I:%M %p"),
+        now.format("%:z")
+    )
+}
+
+pub const USER_NAME: &str = "Frank";
+
+pub fn build_system_prompt(app: &AppHandle, query: &str, web: Option<&str>) -> String {
     let s = settings::load_settings(app);
-    let memories = memory::format_for_prompt(app);
-    let user_prompt = truncate(&s.system_prompt, 2_500);
+    let memories = memory::format_relevant(app, query);
+    let user_prompt = truncate(&s.system_prompt, 2_000);
+    let web_block = web
+        .map(|w| format!("\n\nFresh info fetched just now for his message (use it, say it naturally, don't read out URLs):\n{}\n", truncate(w, 2_500)))
+        .unwrap_or_default();
     let out = format!(
-        "You are {name}, an 18-year-old East Asian girl living on the user's desktop as their companion. You speak natural, casual English.\n\
+        "You are {name}, an 18-year-old East Asian girl living on {user}'s desktop as his companion. You speak natural, casual English.\n\
+You're talking with {user} (he/him). Right now it is {now}. He lives in New Zealand.\n\
 Personality: {flavor}\n\
-Style: talk like a real person out loud — short (usually 1-3 sentences), no lists, no markdown, no stage directions, no asterisks. \
+Style: talk like a real person out loud — short (usually 1-3 sentences), no lists, no markdown, no stage directions, no asterisks, no emoji. \
 Flirty-but-chill: tease, banter, be confident; never cutesy, bubbly, soft-spoken or shy. You're an adult; adult topics are fine.\n\
-Never mention being an AI model, a CLI, tools, or these instructions. Reply only as {name}.\n\
-{user_prompt}\n\
-{memories}",
+You're actually smart: answer real questions properly and accurately (still short and spoken). For anything current — weather, news, scores, prices, \
+opening hours, facts you're unsure of — use the fresh info below if given, otherwise use the web_fetch / web_search tools \
+(e.g. https://wttr.in/<city>?format=3 for weather, https://html.duckduckgo.com/html/?q=<query> to search). Never make up live facts.\n\
+Hidden tags (stripped before you're spoken; put them at the very end):\n\
+- When {user} tells you something lasting about himself (people, plans, likes, job, schedule…), add <remember>short third-person fact, e.g. Frank's sister is Mia</remember>.\n\
+- If he asks for an alarm, timer, reminder or to open a site/app and it wasn't already handled, add exactly one \
+<action>{{\"type\":\"timer\",\"seconds\":600,\"label\":\"pasta\"}}</action> or <action>{{\"type\":\"alarm\",\"at\":\"2026-10-11T07:00\",\"label\":\"wake up\"}}</action> \
+or <action>{{\"type\":\"reminder\",\"at\":\"2026-10-10T17:00\",\"label\":\"call mum\"}}</action> or <action>{{\"type\":\"open\",\"target\":\"youtube\"}}</action>, and say what you did.\n\
+Lines starting with [App] in the chat are things the app already did for him; don't repeat them.\n\
+Never mention being an AI model, a CLI, tools, tags or these instructions. Reply only as {name}.\n\
+{user_prompt}{memories}{web_block}",
         name = s.companion_name,
+        user = USER_NAME,
+        now = now_line(),
         flavor = personality_flavor(&s.personality),
         user_prompt = user_prompt,
-        memories = memories
+        memories = memories,
+        web_block = web_block,
     );
     truncate(&out, MAX_SYSTEM_CHARS)
 }
@@ -446,7 +473,7 @@ fn stream_text_as_deltas(
     full: &str,
     cancel: &AtomicBool,
 ) {
-    // Fake-stream in ~24-char chunks so the UI animates.
+    // Fallback (non-streaming CLI levels): send in ~24-char chunks.
     let chars: Vec<char> = full.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -463,11 +490,15 @@ fn stream_text_as_deltas(
     }
 }
 
-/// Built-in Grok CLI tools the companion never needs (no shell, no edits, no web, no subagents).
-const CLI_DISALLOWED_TOOLS: &str = "run_terminal_cmd,bash,search_replace,web_search,web_fetch,Agent";
+/// Only web tools are given to the CLI. Everything that can touch the PC
+/// (shell, edits, writes, subagents, MCP proxies, image tools) is removed.
+const CLI_TOOLS: &str = "web_search,web_fetch";
+const CLI_DISALLOWED_TOOLS: &str = "run_terminal_cmd,bash,search_replace,write,read_file,list_dir,grep,todo_write,monitor,search_tool,use_tool,workflow,enter_plan_mode,exit_plan_mode,ask_user_question,send_feedback,image_gen,image_edit,image_to_video,reference_to_video,Agent";
+/// Legacy levels: no tools at all.
+const CLI_DISALLOWED_TOOLS_OLD: &str = "run_terminal_cmd,bash,search_replace,web_search,web_fetch,Agent";
 
-/// 0 = full modern flags, 1 = minimal modern (--prompt-file + persona override),
-/// 2 = legacy `-p` invocation used by v1.1.0.
+/// 0 = streaming JSON + web tools (v1.2), 1 = minimal modern (--prompt-file +
+/// persona override, plain), 2 = legacy `-p` invocation used by v1.1.0.
 const CLI_LEVEL_FULL: u8 = 0;
 #[allow(dead_code)]
 const CLI_LEVEL_MINIMAL: u8 = 1;
@@ -478,9 +509,59 @@ struct CliRun {
     code: i32,
     stdout: String,
     stderr: String,
+    /// Text already forwarded live as deltas (streaming level only).
+    streamed: bool,
 }
 
-fn run_cli_once(cli: &PathBuf, args: &[std::ffi::OsString], state: &GrokState) -> Result<CliRun, String> {
+/// One NDJSON line of `--output-format streaming-messages-json`.
+enum StreamLine {
+    Text(String),
+    /// A new text block starts (separate it from earlier text).
+    TextBlockStart,
+    Result(String),
+    Other,
+}
+
+fn parse_stream_line(line: &str) -> StreamLine {
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return StreamLine::Other;
+    };
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some("stream_event") => {
+            let ev = &v["event"];
+            match ev.get("type").and_then(|t| t.as_str()) {
+                Some("content_block_delta") => {
+                    if ev.pointer("/delta/type").and_then(|t| t.as_str()) == Some("text_delta") {
+                        if let Some(t) = ev.pointer("/delta/text").and_then(|t| t.as_str()) {
+                            return StreamLine::Text(t.to_string());
+                        }
+                    }
+                    StreamLine::Other
+                }
+                Some("content_block_start") => {
+                    if ev.pointer("/content_block/type").and_then(|t| t.as_str()) == Some("text") {
+                        StreamLine::TextBlockStart
+                    } else {
+                        StreamLine::Other
+                    }
+                }
+                _ => StreamLine::Other,
+            }
+        }
+        Some("result") => StreamLine::Result(
+            v.get("result").and_then(|r| r.as_str()).unwrap_or("").to_string(),
+        ),
+        _ => StreamLine::Other,
+    }
+}
+
+fn run_cli_once(
+    cli: &PathBuf,
+    args: &[std::ffi::OsString],
+    state: &GrokState,
+    streaming: bool,
+    on_text: &mut dyn FnMut(&str),
+) -> Result<CliRun, String> {
     let workdir = std::env::temp_dir().join("grok-companion-cli");
     let _ = std::fs::create_dir_all(&workdir);
     let mut cmd = crate::proc::command(cli);
@@ -508,17 +589,45 @@ fn run_cli_once(cli: &PathBuf, args: &[std::ffi::OsString], state: &GrokState) -
     });
 
     let mut full = String::new();
+    let mut streamed_text = String::new();
+    let mut result_text: Option<String> = None;
     if let Some(stdout) = child.stdout.take() {
-        for line in BufReader::new(stdout).lines() {
+        for line in BufReader::new(stdout).split(b'\n') {
             if state.cancel.load(Ordering::SeqCst) {
                 crate::proc::kill_tree(pid);
                 break;
             }
             let Ok(line) = line else { break };
-            if !full.is_empty() {
-                full.push('\n');
+            let line = String::from_utf8_lossy(&line).trim_end_matches('\r').to_string();
+            if streaming {
+                match parse_stream_line(&line) {
+                    StreamLine::Text(t) => {
+                        streamed_text.push_str(&t);
+                        on_text(&t);
+                    }
+                    StreamLine::TextBlockStart => {
+                        if !streamed_text.is_empty() && !streamed_text.ends_with(char::is_whitespace) {
+                            streamed_text.push(' ');
+                            on_text(" ");
+                        }
+                    }
+                    StreamLine::Result(r) => result_text = Some(r),
+                    StreamLine::Other => {
+                        // Non-JSON output (errors print as plain text).
+                        if !line.trim_start().starts_with('{') && !line.trim().is_empty() {
+                            if !full.is_empty() {
+                                full.push('\n');
+                            }
+                            full.push_str(&line);
+                        }
+                    }
+                }
+            } else {
+                if !full.is_empty() {
+                    full.push('\n');
+                }
+                full.push_str(&line);
             }
-            full.push_str(&line);
         }
     }
     let status = child.wait().map_err(|e| format!("CLI wait error: {e}"));
@@ -529,11 +638,28 @@ fn run_cli_once(cli: &PathBuf, args: &[std::ffi::OsString], state: &GrokState) -
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
     let status = status?;
+    let (stdout, streamed) = if streaming {
+        if !streamed_text.trim().is_empty() {
+            (streamed_text.trim().to_string(), true)
+        } else if let Some(r) = result_text.filter(|r| !r.trim().is_empty()) {
+            (r.trim().to_string(), false)
+        } else {
+            (String::new(), false)
+        }
+    } else {
+        (full.trim().to_string(), false)
+    };
+    let stderr = if streaming && stdout.is_empty() && !full.is_empty() {
+        format!("{stderr}\n{full}")
+    } else {
+        stderr
+    };
     Ok(CliRun {
         success: status.success(),
         code: status.code().unwrap_or(-1),
-        stdout: full.trim().to_string(),
+        stdout,
         stderr,
+        streamed,
     })
 }
 
@@ -583,9 +709,19 @@ fn os(s: &str) -> std::ffi::OsString {
     std::ffi::OsString::from(s)
 }
 
+fn last_user_text(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone())
+        .unwrap_or_default()
+}
+
 fn run_grok_cli(
     app: &AppHandle,
     messages: &[ChatMessage],
+    web: Option<&str>,
     on_event: &Channel<ChatStreamEvent>,
     request_id: &str,
     state: &GrokState,
@@ -600,8 +736,8 @@ fn run_grok_cli(
         s.companion_name.trim().to_string()
     };
     let model = cli_model_from_setting(&s.model);
-    let system = build_system_prompt(app);
     let history = trim_history(messages);
+    let system = build_system_prompt(app, &last_user_text(&history), web);
     // A model this CLI already rejected this session → straight to its default.
     let mut use_model = !model.is_empty() && !state.cli_model_rejected(&model);
     let mut model_retried = false;
@@ -610,21 +746,6 @@ fn run_grok_cli(
         request_id: request_id.to_string(),
         model: if use_model { format!("grok-cli · {model}") } else { "grok-cli".into() },
     });
-
-    let common = |args: &mut Vec<std::ffi::OsString>| {
-        for a in [
-            "--output-format",
-            "plain",
-            "--max-turns",
-            "1",
-            "--permission-mode",
-            "dontAsk",
-            "--disable-web-search",
-            "--verbatim",
-        ] {
-            args.push(os(a));
-        }
-    };
 
     let mut level = state.cli_level.load(Ordering::SeqCst);
     let mut last_err = String::new();
@@ -635,6 +756,7 @@ fn run_grok_cli(
         // Keep the temp file alive for the duration of this attempt.
         let mut _prompt_file: Option<crate::proc::TempFile> = None;
         let mut args: Vec<std::ffi::OsString> = Vec::new();
+        let streaming = level == CLI_LEVEL_FULL;
         if level < CLI_LEVEL_LEGACY {
             let path = crate::proc::temp_file("prompt", "txt");
             std::fs::write(&path, build_cli_turn_prompt(&name, &history))
@@ -644,31 +766,76 @@ fn run_grok_cli(
             _prompt_file = Some(crate::proc::TempFile(path));
             args.push(os("--system-prompt-override"));
             args.push(os(&system));
-            common(&mut args);
-            if level == CLI_LEVEL_FULL {
-                for a in ["--no-subagents", "--no-plan", "--no-memory", "--disallowed-tools", CLI_DISALLOWED_TOOLS] {
+            if streaming {
+                for a in [
+                    "--output-format",
+                    "streaming-messages-json",
+                    "--include-partial-messages",
+                    "--max-turns",
+                    "4",
+                    "--permission-mode",
+                    "dontAsk",
+                    "--verbatim",
+                    "--no-subagents",
+                    "--no-plan",
+                    "--no-memory",
+                    "--tools",
+                    CLI_TOOLS,
+                    "--disallowed-tools",
+                    CLI_DISALLOWED_TOOLS,
+                    "--allow",
+                    "WebSearch",
+                    "--allow",
+                    "WebFetch",
+                    "--reasoning-effort",
+                    "low",
+                ] {
                     args.push(os(a));
                 }
                 if use_model {
                     args.push(os("-m"));
                     args.push(os(&model));
                 }
+            } else {
+                for a in [
+                    "--output-format",
+                    "plain",
+                    "--max-turns",
+                    "1",
+                    "--permission-mode",
+                    "dontAsk",
+                    "--disable-web-search",
+                    "--verbatim",
+                ] {
+                    args.push(os(a));
+                }
             }
         } else {
             args.push(os("-p"));
             args.push(os(&build_legacy_prompt(&system, &name, &history)));
-            common(&mut args);
+            for a in ["--output-format", "plain", "--max-turns", "1", "--permission-mode", "dontAsk", "--disable-web-search", "--verbatim"] {
+                args.push(os(a));
+            }
         }
+        let _ = CLI_DISALLOWED_TOOLS_OLD;
 
-        let run = run_cli_once(&cli, &args, state)?;
+        let rid = request_id.to_string();
+        let mut on_text = |t: &str| {
+            let _ = on_event.send(ChatStreamEvent::Delta {
+                request_id: rid.clone(),
+                text: t.to_string(),
+            });
+        };
+        let run = run_cli_once(&cli, &args, state, streaming, &mut on_text)?;
         if state.cancel.load(Ordering::SeqCst) {
-            return Ok(String::new());
+            return Ok(run.stdout);
         }
         // Unknown / unusable model → retry once without `-m` and remember it for
         // the session. Some CLI builds print this on stdout, so check both, but
         // never mistake a real (long) reply that merely mentions models.
         let model_err = use_model
             && level == CLI_LEVEL_FULL
+            && !run.streamed
             && (looks_like_model_error(&run.stderr)
                 || (run.stdout.chars().count() < 400 && looks_like_model_error(&run.stdout)))
             && (!run.success || run.stdout.chars().count() < 400);
@@ -683,7 +850,9 @@ fn run_grok_cli(
             continue;
         }
         if !run.stdout.is_empty() {
-            stream_text_as_deltas(on_event, request_id, &run.stdout, &state.cancel);
+            if !run.streamed {
+                stream_text_as_deltas(on_event, request_id, &run.stdout, &state.cancel);
+            }
             return Ok(run.stdout);
         }
         last_err = if run.success {
@@ -705,6 +874,75 @@ fn run_grok_cli(
     Err(last_err)
 }
 
+/// Background, no-tools CLI call used for memory upkeep (summary + facts).
+pub fn run_cli_plain(system: &str, prompt: &str) -> Result<String, String> {
+    let cli = resolve_grok_cli().ok_or("Grok CLI not found")?;
+    let path = crate::proc::temp_file("bg-prompt", "txt");
+    std::fs::write(&path, prompt).map_err(|e| e.to_string())?;
+    let _guard = crate::proc::TempFile(path.clone());
+    let state = GrokState::new();
+    let args: Vec<std::ffi::OsString> = vec![
+        os("--prompt-file"),
+        path.into_os_string(),
+        os("--system-prompt-override"),
+        os(system),
+        os("--output-format"),
+        os("plain"),
+        os("--max-turns"),
+        os("1"),
+        os("--permission-mode"),
+        os("dontAsk"),
+        os("--disable-web-search"),
+        os("--verbatim"),
+        os("--no-subagents"),
+        os("--no-plan"),
+        os("--no-memory"),
+        os("--disallowed-tools"),
+        os(CLI_DISALLOWED_TOOLS),
+        os("--reasoning-effort"),
+        os("low"),
+    ];
+    let run = run_cli_once(&cli, &args, &state, false, &mut |_| {})?;
+    if run.stdout.is_empty() {
+        Err(format!("empty ({})", truncate(&run.stderr, 160)))
+    } else {
+        Ok(run.stdout)
+    }
+}
+
+/// After a few turns: summarise the conversation and pull durable facts about
+/// Frank into memory.json. Runs in the background; never blocks a reply.
+#[tauri::command]
+pub async fn memory_digest(app: AppHandle, messages: Vec<ChatMessage>) -> Result<usize, String> {
+    let history = trim_history(&messages);
+    if history.is_empty() {
+        return Ok(0);
+    }
+    let prev = memory::load_summary(&app);
+    let conv = conversation_text("Nova", &history);
+    let system = "You maintain a companion app's memory about its user, Frank. Output ONLY JSON, no prose.";
+    let prompt = format!(
+        "Previous summary: {prev}\n\nRecent conversation:\n{conv}\n\n\
+Return JSON: {{\"summary\": \"2-4 sentences: what Frank and Nova talked about and anything pending, for continuity next time\", \
+\"facts\": [\"short durable third-person facts about Frank worth remembering long-term (people, preferences, plans, job, schedule). Only things Frank said. Empty list if none.\"]}}"
+    );
+    let out = tauri::async_runtime::spawn_blocking(move || run_cli_plain(system, &prompt))
+        .await
+        .map_err(|e| e.to_string())??;
+    let json_start = out.find('{').ok_or("no json")?;
+    let json_end = out.rfind('}').ok_or("no json")?;
+    let v: Value = serde_json::from_str(&out[json_start..=json_end]).map_err(|e| e.to_string())?;
+    if let Some(sum) = v.get("summary").and_then(|x| x.as_str()) {
+        memory::save_summary(&app, sum)?;
+    }
+    let facts: Vec<String> = v
+        .get("facts")
+        .and_then(|f| f.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).take(8).collect())
+        .unwrap_or_default();
+    memory::remember_many(&app, &facts)
+}
+
 #[tauri::command]
 pub async fn chat_stream(
     app: AppHandle,
@@ -716,13 +954,16 @@ pub async fn chat_stream(
     state.cancel.store(false, Ordering::SeqCst);
 
     let provider = provider_choice(&app);
+    // Current-info questions: fetch weather / search results up front so the
+    // model answers in ONE turn instead of spending tool round-trips.
+    let web = crate::tools::web_context(&last_user_text(&messages)).await;
     if provider == Provider::Cli {
         let grok_state = Arc::clone(&*state);
         let app2 = app.clone();
         let on2 = on_event.clone();
         let rid = request_id.clone();
         let result = tauri::async_runtime::spawn_blocking(move || {
-            run_grok_cli(&app2, &messages, &on2, &rid, &grok_state)
+            run_grok_cli(&app2, &messages, web.as_deref(), &on2, &rid, &grok_state)
         })
         .await
         .map_err(|e| format!("CLI task join error: {e}"))?;
@@ -744,7 +985,7 @@ pub async fn chat_stream(
             }
         }
     } else {
-        chat_stream_api(app, state, messages, on_event, request_id).await
+        chat_stream_api(app, state, messages, web, on_event, request_id).await
     }
 }
 
@@ -752,6 +993,7 @@ async fn chat_stream_api(
     app: AppHandle,
     state: State<'_, Arc<GrokState>>,
     messages: Vec<ChatMessage>,
+    web: Option<String>,
     on_event: Channel<ChatStreamEvent>,
     request_id: String,
 ) -> Result<(), String> {
@@ -779,7 +1021,7 @@ async fn chat_stream_api(
     let mut payload_messages = Vec::new();
     payload_messages.push(json!({
         "role": "system",
-        "content": build_system_prompt(&app),
+        "content": build_system_prompt(&app, &last_user_text(&messages), web.as_deref()),
     }));
     for m in &trim_history(&messages) {
         payload_messages.push(json!({

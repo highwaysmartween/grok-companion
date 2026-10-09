@@ -25,6 +25,12 @@
 }
 
 .settings-card header {
+  position: sticky;
+  top: -14px;
+  margin: -14px -14px 0;
+  padding: 10px 14px;
+  background: rgba(14, 24, 52, 0.98);
+  z-index: 2;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -32,10 +38,14 @@
 .settings-card h2 { margin: 0; font-size: 16px; }
 .settings-card h3 { margin: 8px 0 4px; font-size: 13px; }
 .settings-card .x {
-  background: transparent;
-  border: 0;
+  background: rgba(126, 240, 255, 0.12);
+  border: 1px solid rgba(126, 240, 255, 0.4);
+  border-radius: 999px;
+  width: 32px;
+  height: 32px;
+  line-height: 1;
   color: #7ef0ff;
-  font-size: 22px;
+  font-size: 16px;
   cursor: pointer;
 }
 
@@ -117,3 +127,6 @@
   color: #7ef0ff;
 }
 .status-msg { font-size: 12px; color: #7ef0ff; margin: 0; }
+
+.settings-card .credit { color: rgba(126, 240, 255, 0.8); }
+.settings-backdrop { padding-top: 10px; }

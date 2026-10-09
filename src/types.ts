@@ -21,6 +21,8 @@ export interface ChatMessage {
   pending?: boolean;
   error?: boolean;
   local?: boolean;
+  /** Local tool reply (alarm set, site opened…) — given to the brain as "[App] …". */
+  tool?: boolean;
 }
 
 export interface PublicSettings {
@@ -45,6 +47,8 @@ export interface PublicSettings {
   wakeWordEnabled: boolean;
   /** "Playful (jump on icons)" — default off. */
   playful: boolean;
+  /** Her size, 0.5 – 2.0. */
+  petScale: number;
 }
 
 export interface SettingsPayload {
@@ -67,6 +71,8 @@ export interface SettingsPayload {
   wakeWordEnabled: boolean;
   /** "Playful (jump on icons)" — default off. */
   playful: boolean;
+  /** Her size, 0.5 – 2.0. */
+  petScale: number;
 }
 
 export interface ConnectionStatus {

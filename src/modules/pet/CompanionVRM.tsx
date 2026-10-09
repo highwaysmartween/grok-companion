@@ -34,7 +34,7 @@ import {
   type RoamDriver,
   type StrollMotion,
 } from "./behaviour";
-import { FlashRig, FlashTop } from "./flash";
+import { FlashRig, FlashTop, type FlashMode } from "./flash";
 
 export interface GestureCue {
   kind: GestureKind;
@@ -50,6 +50,8 @@ interface Props {
   flash?: boolean;
   /** Bump to play the flash move once (she pulls her top up, holds, lowers it). */
   flashKey?: number;
+  /** Reports what the flash can do on this model once it's loaded. */
+  onFlashMode?: (modelUrl: string, mode: FlashMode) => void;
   /** How much she wanders. "off" = never walks (idle / look / turn still run). */
   roamAmount?: RoamAmount;
   /** Strolls allowed right now (not paused by hover / chat / tray). */
@@ -208,7 +210,10 @@ export function CompanionVRM({
   reactKey = 0,
   cue = null,
   roamDriver,
+  onFlashMode,
 }: Props) {
+  const onFlashModeRef = useRef(onFlashMode);
+  onFlashModeRef.current = onFlashMode;
   const mountRef = useRef<HTMLDivElement>(null);
   const moodRef = useRef(mood);
   const flashRef = useRef(flash);
@@ -712,6 +717,7 @@ export function CompanionVRM({
         flashTop = new FlashTop(loaded);
         flashRig = new FlashRig(loaded, flashTop);
         console.info("[pet] flash:", flashTop.mode, flashTop.reason, flashTop.topNames);
+        onFlashModeRef.current?.(modelUrl, flashTop.mode);
         mixer = new THREE.AnimationMixer(loaded.scene);
 
         const em = loaded.expressionManager;

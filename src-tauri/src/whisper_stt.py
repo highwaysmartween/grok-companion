@@ -5,8 +5,13 @@ Same stdout protocol as the System.Speech PowerShell scripts:
                exit 1 = timed out with no wake word
   listen mode: READY, then TEXT:<what was said>               (exit 0)
 Exit 2 = runtime error (stderr), exit 3 = engine unavailable (caller falls back).
+
+serve mode (v1.2): ONE long-lived process keeps the mic stream and the model
+warm. Jobs arrive on stdin, one per line:
+  wake <secs> <command_secs> <name...>   |  listen <secs>   |  cancel
+and each job prints ARMED, then WAKE / TEXT:... as above, then END <code>.
 """
-import argparse, os, queue, re, sys, time
+import argparse, os, queue, re, sys, threading, time
 
 try:
     import numpy as np
@@ -42,13 +47,23 @@ class Mic:
         self.stream.start()
         self.floor = 0.004
 
-    def utterance(self, deadline, initial_silence=None, end_silence=0.8, max_len=14.0):
-        """Next speech segment (np array) or None at deadline / initial-silence timeout."""
+    def flush(self):
+        """Drop audio captured while nobody was listening (e.g. her own voice)."""
+        try:
+            while True:
+                self.q.get_nowait()
+        except queue.Empty:
+            pass
+
+    def utterance(self, deadline, initial_silence=None, end_silence=0.7, max_len=14.0, cancelled=None):
+        """Next speech segment (np array) or None at deadline / initial-silence timeout / cancel."""
         start_wait = time.time()
         pre, speech, silent, started = [], [], 0.0, False
         while time.time() < deadline:
+            if cancelled is not None and cancelled():
+                return None
             try:
-                b = self.q.get(timeout=0.5)
+                b = self.q.get(timeout=0.1)
             except queue.Empty:
                 continue
             rms = float(np.sqrt(np.mean(b * b)) + 1e-9)
@@ -85,14 +100,95 @@ def transcribe(model, audio):
     return " ".join(p.strip() for p in parts).strip()
 
 
+def wake_job(mic, model, secs, command_secs, name, cancelled):
+    """Returns exit-style code: 0 = woke (TEXT printed), 1 = timeout/cancel."""
+    deadline = time.time() + secs
+    while time.time() < deadline and not cancelled():
+        # VAD end-of-speech: 0.65 s of quiet closes "hey nova, <command>".
+        seg = mic.utterance(deadline, end_silence=0.65, cancelled=cancelled)
+        if seg is None:
+            break
+        t0 = time.time()
+        text = transcribe(model, seg)
+        words = norm(text)
+        if os.environ.get("GC_STT_DEBUG"):
+            print(f"heard: {text!r} ({(time.time()-t0)*1000:.0f} ms)", file=sys.stderr, flush=True)
+        if not words or words[0] not in WAKE_ALIASES:
+            continue
+        out("WAKE")
+        rest = words[1:]
+        if name and rest[: len(name)] == name:
+            rest = rest[len(name):]
+        if rest:
+            out("TEXT:" + text)
+            return 0
+        seg = mic.utterance(time.time() + command_secs, initial_silence=6.0, end_silence=0.9, cancelled=cancelled)
+        cmd = transcribe(model, seg) if seg is not None else ""
+        out("TEXT:" + ("" if cmd.lower().strip(" .!?") in JUNK else cmd))
+        return 0
+    return 1
+
+
+def serve(model_name):
+    try:
+        mic = Mic()
+        model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=4)
+        # Warm-up so the first real transcription isn't slow.
+        transcribe(model, np.zeros(RATE // 2, dtype="float32") + 1e-4)
+    except Exception as e:
+        print(f"whisper start failed: {e}", file=sys.stderr)
+        return 3
+    jobs = queue.Queue()
+    cancel = threading.Event()
+
+    def reader():
+        for line in sys.stdin:
+            line = line.strip()
+            if line == "cancel":
+                cancel.set()
+            elif line:
+                jobs.put(line)
+        jobs.put("quit")
+        cancel.set()
+
+    threading.Thread(target=reader, daemon=True).start()
+    out("LOADED")
+    while True:
+        job = jobs.get()
+        if job == "quit":
+            return 0
+        cancel.clear()
+        parts = job.split(" ")
+        mic.flush()
+        out("ARMED")
+        out("READY")
+        code = 1
+        try:
+            if parts[0] == "wake":
+                secs = float(parts[1]); csecs = float(parts[2]); name = norm(" ".join(parts[3:]))
+                code = wake_job(mic, model, secs, csecs, name, cancel.is_set)
+            elif parts[0] == "listen":
+                secs = float(parts[1])
+                seg = mic.utterance(time.time() + secs, initial_silence=7.0, end_silence=0.9, cancelled=cancel.is_set)
+                text = transcribe(model, seg) if seg is not None else ""
+                out("TEXT:" + ("" if text.lower().strip(" .!?") in JUNK else text))
+                code = 0
+        except Exception as e:
+            print(f"job error: {e}", file=sys.stderr, flush=True)
+            code = 2
+        out(f"END {code}")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["wake", "listen"])
+    ap.add_argument("mode", choices=["wake", "listen", "serve"])
     ap.add_argument("--secs", type=float, default=12)
     ap.add_argument("--command-secs", type=float, default=10)
     ap.add_argument("--name", default="")
     ap.add_argument("--model", default=os.environ.get("GC_WHISPER_MODEL", "base.en"))
     a = ap.parse_args()
+    if a.mode == "serve":
+        return serve(a.model)
     try:
         mic = Mic()  # start capturing first so nothing said during model load is lost
         model = WhisperModel(a.model, device="cpu", compute_type="int8", cpu_threads=4)

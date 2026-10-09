@@ -27,6 +27,7 @@
     "core:window:allow-scale-factor",
     "autostart:default",
     "store:default",
-    "opener:default"
+    "opener:default",
+    "notification:default"
   ]
 }

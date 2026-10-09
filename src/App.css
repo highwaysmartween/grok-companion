@@ -18,3 +18,14 @@ body { font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif; colo
 .wake-hint:empty { display:none; }
 .banner.subtle { color:rgba(200,225,240,.75); font-size:11px; }
 .is-compact .banner { position:absolute; z-index:6; left:12px; right:12px; bottom:64px; margin:0; padding:6px 10px; border-radius:10px; background:rgba(5,12,28,.82); text-align:center; }
+
+/* 1.2: chat panel sits beside her (window widens), never on top of her. */
+.is-compact.chat-open { position:relative; width:100vw; height:100vh; }
+.is-compact.chat-open .compact-chat { left:auto; right:auto; top:auto; bottom:10px; width:324px; height:min(450px, calc(100vh - 20px)); padding-top:40px; }
+.is-compact.chat-right .compact-chat { right:8px; }
+.is-compact.chat-left .compact-chat { left:8px; }
+.compact-chat .chat-close { width:30px; height:30px; border-radius:999px; border:1px solid rgba(126,240,255,.45) !important; background:rgba(126,240,255,.14) !important; font-size:15px !important; line-height:1; display:grid; place-items:center; }
+.compact-chat .chat-close:hover { background:rgba(126,240,255,.3) !important; }
+.compact-chat::before { content:"Chat · Esc to close"; position:absolute; left:16px; top:13px; font-size:11px; letter-spacing:.06em; color:rgba(180,210,230,.7); }
+.is-compact .companion-click-target { cursor:grab; }
+.is-compact .companion-click-target:active { cursor:grabbing; }

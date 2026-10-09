@@ -20,10 +20,11 @@ import type { FlashFrame } from "./behaviour";
  *  - "deform": allows sexual use (VRM meta) and has a separate top primitive.
  *  - "hide":   allows sexual use, top found but no usable bind data → the top is
  *              hidden exactly when the hands pass the chest (fallback c).
- *  - "none":   the model's licence disallows sexual use, or it has no separate
- *              top → no reveal at all on that model.
+ *  - "pose":   allows sexual use and wears no top at all (e.g. a nude base body)
+ *              → just the arms / pose / giggle; nothing to lift, no stand-in torso.
+ *  - "none":   the model's licence disallows sexual use → no flash at all.
  */
-export type FlashMode = "deform" | "hide" | "none";
+export type FlashMode = "deform" | "hide" | "pose" | "none";
 
 /** Upper-body clothing (VRoid "Tops", generic names). Skirts / pants / one-pieces are never touched. */
 const TOP_RE = /TOPS|SHIRT|JACKET|COAT|HOODIE|SWEATER|BLOUSE|CAMI|トップス|上着|シャツ/i;
@@ -266,8 +267,8 @@ export class FlashTop {
       return;
     }
     if (!tops.length) {
-      this.mode = "none";
-      this.reason = "no separate top primitive";
+      this.mode = "pose";
+      this.reason = "no top (nude body) → arm/pose move only";
       return;
     }
     const L = tops[0]!.isSkinnedMesh ? landmarks(vrm, tops[0]!) : null;

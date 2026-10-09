@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, currentMonitor, primaryMonitor } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { Companion, snapToFloor } from "./modules/pet/Companion";
 import { normalizeRoamAmount, type GestureKind } from "./modules/pet/behaviour";
 import { gestureForReply } from "./modules/pet/gestures";
@@ -12,10 +13,31 @@ import { useChat } from "./modules/chat/useChat";
 import { useVoice } from "./modules/voice/useVoice";
 import { getSettings, saveSettings, toPayload } from "./modules/settings/settingsApi";
 import { checkConnection } from "./modules/chat/chatApi";
+import { latencyMark } from "./modules/chat/latency";
+import { playChime } from "./modules/voice/speech";
+import type { FlashMode } from "./modules/pet/flash";
+import { fmtClock, type Alarm } from "./modules/tools/intents";
 import type { ConnectionKind, PetMood, PublicSettings } from "./types";
 import "./App.css";
 
-type ModelOpt = { id: string; name: string; file: string };
+type ModelOpt = {
+  id: string;
+  name: string;
+  file: string;
+  /** Licence credit line shown in Settings when this model is selected. */
+  credit?: string;
+  /** Preferred model for "flash" when the current one can't. */
+  flashTarget?: boolean;
+};
+
+/** Compact pet window at 100% (logical px). */
+const PET_W = 440;
+const PET_H = 640;
+const CHAT_W = 340;
+const CHAT_MIN_H = 470;
+const SETTINGS_MIN_W = 440;
+const SETTINGS_MIN_H = 620;
+const clampScale = (v: number) => Math.min(2, Math.max(0.5, Math.round(v * 100) / 100));
 
 const FLASH_LINES = [
   "Okay… fine. Eyes up here though.",
@@ -67,6 +89,14 @@ export default function App() {
     setCue({ kind, id: cueSeq.current });
   }, []);
   const preFlashIdx = useRef<number | null>(null);
+  const flashModes = useRef<Record<string, FlashMode>>({});
+  const [scale, setScale] = useState(1);
+  const scaleRef = useRef(1);
+  scaleRef.current = scale;
+  const [chatSide, setChatSide] = useState<"left" | "right">("right");
+  const [dragging, setDragging] = useState(false);
+  const dragRef = useRef<{ x: number; y: number; started: boolean } | null>(null);
+  const suppressClick = useRef(false);
   const restoredModel = useRef(false);
   const sendRef = useRef<(text: string, meta?: { fromVoice?: boolean }) => Promise<void>>(async () => undefined);
   const lastInteractionRef = useRef(Date.now());
@@ -86,7 +116,11 @@ export default function App() {
     wakeWord: "hey",
     name,
     voice: settings?.voiceTarget,
-    onWake: () => fireCue("wave"),
+    onWake: () => {
+      latencyMark("wake");
+      fireCue("wave");
+    },
+    onAudioStart: () => latencyMark("audio-start"),
     onFinalTranscript: (text) => {
       setInput("");
       touchMood(classifyUserMood(text));
@@ -96,7 +130,7 @@ export default function App() {
   const chat = useChat({
     settings,
     setMood: touchMood,
-    speakReply: (text) => voice.speak(plainForSpeech(text)),
+    speakReply: (text, mode) => voice.speak(plainForSpeech(text), mode),
     onReply: (text, replyMood) => {
       const g = gestureForReply(text, replyMood);
       if (g) fireCue(g);
@@ -116,11 +150,15 @@ export default function App() {
   const handleUserText = useCallback(async (text: string, meta?: { fromVoice?: boolean }) => {
     const flashCmd = isFlashCommand(text);
     if (flashCmd === "on") {
-      const prefer = (m: ModelOpt) => /r18|companion\.vrm$|companion_05/i.test(`${m.id} ${m.file}`);
+      // Stay on the current model if it can flash; otherwise switch to the
+      // nude base (bundled in the personal build) or, failing that, r18.
       const cur = modelsCatalog[modelIdx];
-      if (!cur || !prefer(cur)) {
-        const idx = modelsCatalog.findIndex(prefer);
-        if (idx >= 0) {
+      const curMode = cur ? flashModes.current[cur.file] : undefined;
+      if (!cur || !curMode || curMode === "none") {
+        const isR18 = (m: ModelOpt) => /r18|companion\.vrm$|companion_05/i.test(`${m.id} ${m.file}`);
+        let idx = modelsCatalog.findIndex((m) => m.flashTarget);
+        if (idx < 0) idx = modelsCatalog.findIndex(isR18);
+        if (idx >= 0 && idx !== modelIdx) {
           if (preFlashIdx.current == null) preFlashIdx.current = modelIdx;
           setModelIdx(idx);
         }
@@ -188,9 +226,16 @@ export default function App() {
   }, [fireCue]);
 
   useEffect(() => {
-    void fetch("/models/catalog.json").then((r) => r.json()).then((list: ModelOpt[]) => {
-      if (Array.isArray(list) && list.length) setModelsCatalog(list);
-    }).catch(() => setModelsCatalog([{ id: "default", name: "Companion", file: "/models/companion.vrm" }]));
+    const pub = fetch("/models/catalog.json").then((r) => r.json()).catch(() => [{ id: "default", name: "Companion", file: "/models/companion.vrm" }]);
+    // Personal builds only: models that may not be redistributed live in the
+    // git-ignored public/models-private/ (with its own catalog.json).
+    const priv = fetch("/models-private/catalog.json")
+      .then((r) => (r.ok ? r.json() : []))
+      .catch(() => []);
+    void Promise.all([pub, priv]).then(([a, b]: [ModelOpt[], ModelOpt[]]) => {
+      const list = [...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])];
+      if (list.length) setModelsCatalog(list);
+    });
   }, []);
 
   // Restore the chosen character once both settings and catalog are known.
@@ -267,13 +312,207 @@ export default function App() {
     };
   }, []);
 
+  // --- window layout: size (scale) + chat panel beside her -----------------
+  const layoutRef = useRef<{ side: "left" | "right" | null; scale: number; settings: boolean }>({ side: null, scale: 1, settings: false });
+  const applyLayout = useCallback(async (nextScale: number, chat: boolean, settingsOn: boolean) => {
+    try {
+      const win = getCurrentWindow();
+      const sf = await win.scaleFactor();
+      const monitor = (await currentMonitor()) ?? (await primaryMonitor());
+      const pos = await win.outerPosition();
+      const size = await win.outerSize();
+      const prev = layoutRef.current;
+      // Where her body currently is (left edge, physical px).
+      const petLeft = pos.x + (prev.side === "left" ? Math.round(CHAT_W * sf) : 0);
+      const bottom = pos.y + size.height;
+      const petW = Math.round(PET_W * nextScale * sf);
+      const petH = Math.round(PET_H * nextScale * sf);
+      let side: "left" | "right" | null = null;
+      let w = petW;
+      let h = petH;
+      if (chat) {
+        const room = monitor ? monitor.workArea.position.x + monitor.workArea.size.width - (petLeft + petW) : 1e9;
+        side = room >= CHAT_W * sf ? "right" : "left";
+        w = petW + Math.round(CHAT_W * sf);
+        h = Math.max(petH, Math.round(CHAT_MIN_H * sf));
+      }
+      if (settingsOn) {
+        w = Math.max(w, Math.round(SETTINGS_MIN_W * sf));
+        h = Math.max(h, Math.round(SETTINGS_MIN_H * sf));
+      }
+      let x = side === "left" ? petLeft - Math.round(CHAT_W * sf) : petLeft;
+      let y = bottom - h;
+      if (monitor) {
+        const wa = monitor.workArea;
+        x = Math.min(Math.max(x, wa.position.x), wa.position.x + wa.size.width - w);
+        y = Math.min(Math.max(y, wa.position.y), wa.position.y + wa.size.height - h);
+      }
+      layoutRef.current = { side, scale: nextScale, settings: settingsOn };
+      setChatSide(side ?? "right");
+      await invoke("pet_set_bounds", { x: Math.round(x), y: Math.round(y), width: Math.round(w), height: Math.round(h) });
+    } catch {
+      // browser preview
+    }
+  }, []);
+
+  // Size from settings (and tray Small / Medium / Large).
+  useEffect(() => {
+    if (settings?.petScale) setScale(clampScale(settings.petScale));
+  }, [settings?.petScale]);
+  useEffect(() => {
+    if (!compact) return;
+    void applyLayout(scale, chatOpen, settingsOpen);
+  }, [scale, chatOpen, settingsOpen, compact, applyLayout]);
+
+  const persistScaleTimer = useRef(0);
+  const changeScale = useCallback((next: number, save = true) => {
+    const v = clampScale(next);
+    setScale(v);
+    if (!save) return;
+    window.clearTimeout(persistScaleTimer.current);
+    persistScaleTimer.current = window.setTimeout(() => void persist({ petScale: v }), 600);
+  }, [persist]);
+
+  // Esc closes chat / settings; leaving the window closes the chat.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (settingsOpen) setSettingsOpen(false);
+      else if (chatOpen && compact) setChatOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [settingsOpen, chatOpen, compact]);
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    let disposed = false;
+    void getCurrentWindow()
+      .onFocusChanged(({ payload: focused }) => {
+        if (!focused && compact && !dragRef.current) setChatOpen(false);
+      })
+      .then((fn) => (disposed ? fn() : (off = fn)))
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      off?.();
+    };
+  }, [compact]);
+
+  // Drag her anywhere: OS drag on mouse-down + move; a click without movement is a tap.
+  const lastRect = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    let disposed = false;
+    let settle = 0;
+    void getCurrentWindow()
+      .onMoved(({ payload }) => {
+        if (!dragRef.current?.started) return;
+        // OS drags move the window too — repaint what she uncovers on the way.
+        const prev = lastRect.current;
+        if (prev) void invoke("pet_repaint_behind", { x: prev.x, y: prev.y, width: prev.w, height: prev.h }).catch(() => undefined);
+        void getCurrentWindow().outerSize().then((sz) => {
+          lastRect.current = { x: payload.x, y: payload.y, w: sz.width, h: sz.height };
+        });
+        window.clearTimeout(settle);
+        settle = window.setTimeout(() => {
+          dragRef.current = null;
+          setDragging(false);
+          void invoke("pet_save_position", { x: payload.x, y: payload.y }).catch(() => undefined);
+        }, 450);
+      })
+      .then((fn) => (disposed ? fn() : (off = fn)))
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      window.clearTimeout(settle);
+      off?.();
+    };
+  }, []);
+
+  const onPetMouseDown = (e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    dragRef.current = { x: e.screenX, y: e.screenY, started: false };
+    suppressClick.current = false;
+  };
+  const onPetMouseMove = (e: React.MouseEvent) => {
+    const d = dragRef.current;
+    if (!d || d.started || (e.buttons & 1) === 0) return;
+    if (Math.hypot(e.screenX - d.x, e.screenY - d.y) < 5) return;
+    d.started = true;
+    suppressClick.current = true;
+    setDragging(true);
+    void (async () => {
+      try {
+        const win = getCurrentWindow();
+        const [p, sz] = await Promise.all([win.outerPosition(), win.outerSize()]);
+        lastRect.current = { x: p.x, y: p.y, w: sz.width, h: sz.height };
+        await win.startDragging();
+      } catch {
+        dragRef.current = null;
+        setDragging(false);
+      }
+    })();
+  };
+  const onPetMouseUp = () => {
+    if (dragRef.current && !dragRef.current.started) dragRef.current = null;
+  };
+  const onPetWheel = (e: React.WheelEvent) => {
+    if (!compact) return;
+    changeScale(scaleRef.current * (e.deltaY < 0 ? 1.06 : 1 / 1.06));
+  };
+
+  // Alarms / timers / reminders firing (Rust shows her + a Windows notification).
+  const alarmDeps = useRef({ chat, voice, fireCue, touchMood });
+  alarmDeps.current = { chat, voice, fireCue, touchMood };
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    let disposed = false;
+    void listen<Alarm>("alarm-due", (e) => {
+      const a = e.payload;
+      const line =
+        a.kind === "timer"
+          ? `Frank, your timer's done${a.label ? ` — ${a.label}` : ""}.`
+          : a.kind === "reminder"
+            ? `Hey Frank, reminder: ${a.label || "you asked me to remind you now"}.`
+            : `Frank, it's ${fmtClock(a.dueMs).replace(/ today$/, "")}. Your alarm${a.label && a.label !== "wake up" ? ` for ${a.label}` : ""}. Time to get up.`;
+      const { chat, voice, fireCue, touchMood } = alarmDeps.current;
+      playChime(a.kind === "alarm" ? 3 : 2);
+      fireCue("wave");
+      touchMood("happy");
+      chat.announce(line);
+      window.setTimeout(() => voice.speak(line, "queue"), a.kind === "alarm" ? 3200 : 2100);
+    })
+      .then((fn) => (disposed ? fn() : (off = fn)))
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      off?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    let disposed = false;
+    void listen<number>("tray-scale", (e) => {
+      setSettings((s) => (s ? { ...s, petScale: e.payload } : s));
+      setScale(clampScale(e.payload));
+    })
+      .then((fn) => (disposed ? fn() : (off = fn)))
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      off?.();
+    };
+  }, []);
+
   const title = useMemo(() => `${name} — Grok Companion`, [name]);
   const toggleCompact = async () => {
     const next = !compact; setCompact(next); setChatOpen(!next);
     try {
       const { LogicalSize } = await import("@tauri-apps/api/dpi");
       const win = getCurrentWindow();
-      await win.setSize(new LogicalSize(next ? 440 : 480, next ? 640 : 820));
+      if (!next) await win.setSize(new LogicalSize(480, 820));
+      else layoutRef.current = { side: null, scale: scaleRef.current, settings: false };
       await win.setAlwaysOnTop(next || !!settings?.alwaysOnTop);
       if (next) void snapToFloor();
     } catch {
@@ -284,11 +523,19 @@ export default function App() {
   const wakeHint = voice.listening ? voice.interim || "Listening…" : voice.wakeArmed ? "Say “hey”…" : voice.speaking ? "Speaking…" : voice.wakeStatus ? "“hey” isn't working — tap to talk" : null;
   // Tray "Pause roaming" clears roamEnabled; the amount itself is kept.
   const roamAmount = settings && settings.roamEnabled !== false ? normalizeRoamAmount(settings.roamAmount) : "off";
-  const roamPaused = !compact || chatOpen || settingsOpen || hovered;
+  const roamPaused = !compact || chatOpen || settingsOpen || hovered || dragging;
   const micActive = voice.listening || voice.speaking;
 
+  const petStyle: React.CSSProperties | undefined =
+    compact && chatOpen ? { position: "absolute", bottom: 0, [chatSide === "right" ? "left" : "right"]: 0, width: Math.round(PET_W * scale) } : undefined;
+  const credit = modelsCatalog[modelIdx]?.credit ?? null;
+
   return <div
-    className={`shell ${compact ? "is-compact" : ""}`}
+    className={`shell ${compact ? "is-compact" : ""} ${compact && chatOpen ? `chat-open chat-${chatSide}` : ""}`}
+    onMouseDown={(e) => {
+      // Click on empty (transparent) space closes the chat.
+      if (compact && chatOpen && e.target === e.currentTarget) setChatOpen(false);
+    }}
     onMouseEnter={() => setHovered(true)}
     onMouseLeave={() => setHovered(false)}
     onMouseMove={bumpActivity}
@@ -299,14 +546,31 @@ export default function App() {
       <button type="button" onClick={() => void toggleCompact()} title="Toggle companion view">{compact ? "▣" : "▬"}</button>
       <button type="button" onClick={() => setSettingsOpen(true)} title="Settings">⚙</button>
       <button type="button" onClick={() => void getCurrentWindow().minimize()} title="Minimize">–</button>
-      <button type="button" onClick={() => void getCurrentWindow().hide()} title="Hide to tray (Quit from the tray icon)">×</button>
+      <button type="button" onClick={() => void invoke("pet_hide").catch(() => getCurrentWindow().hide())} title="Hide to tray (Quit from the tray icon)">×</button>
     </div></header>
-    <div className="companion-click-target" onClick={() => { setReactKey((k) => k + 1); bumpActivity(); if (compact) setChatOpen(true); }} title="Open companion chat">
-      <Companion mood={mood} name={name} compact={compact} modelUrl={modelsCatalog[modelIdx]?.file} flash={flash} flashKey={flashKey} roamAmount={roamAmount} roamPaused={roamPaused} reactKey={reactKey} cue={cue} playful={!!settings?.playful} />
+    <div
+      className="companion-click-target"
+      style={petStyle}
+      onMouseDown={onPetMouseDown}
+      onMouseMove={onPetMouseMove}
+      onMouseUp={onPetMouseUp}
+      onWheel={onPetWheel}
+      onClick={() => {
+        if (suppressClick.current) {
+          suppressClick.current = false;
+          return;
+        }
+        setReactKey((k) => k + 1);
+        bumpActivity();
+        if (compact) setChatOpen((o) => !o);
+      }}
+      title="Tap to chat · drag to move · scroll to resize"
+    >
+      <Companion mood={mood} name={name} compact={compact} modelUrl={modelsCatalog[modelIdx]?.file} flash={flash} flashKey={flashKey} roamAmount={roamAmount} roamPaused={roamPaused} reactKey={reactKey} cue={cue} playful={!!settings?.playful} scale={scale} onFlashMode={(url, m) => { flashModes.current[url] = m; }} />
     </div>
     {!compact && <StatusBar connection={connection} connectionMessage={connectionMessage} mood={mood} listening={voice.listening} speaking={voice.speaking} busy={chat.busy} wakeArmed={voice.wakeArmed} interim={voice.interim} />}
     {(!compact || chatOpen) && <div className={compact ? "compact-chat" : "full-chat"}>
-      {compact && <button type="button" className="chat-close" onClick={() => setChatOpen(false)}>×</button>}
+      {compact && <button type="button" className="chat-close" onClick={() => setChatOpen(false)} aria-label="Close chat" title="Close chat (Esc)">✕</button>}
       <ChatPanel messages={chat.messages} busy={chat.busy} listening={voice.listening} interim={voice.interim || (voice.wakeArmed ? "Say hey…" : "")} input={input} onInput={setInput} onSend={sendTyped} onMic={() => (voice.listening ? voice.stopListen() : voice.startListen())} onStopSpeak={() => { voice.stopSpeak(); touchMood("idle"); }} speaking={voice.speaking} sttAvailable={voice.sttAvailable} companionName={name} />
     </div>}
     {compact && !chatOpen && <div className={`compact-mic ${micActive ? "active" : ""}`}>
@@ -327,6 +591,8 @@ export default function App() {
       chatCount={chat.messages.length}
       onClearChat={() => chat.clear()}
       onClose={() => setSettingsOpen(false)}
+      credit={credit}
+      onScalePreview={(v) => changeScale(v, false)}
       onSaved={(s) => {
         setSettings(s);
         void getCurrentWindow().setAlwaysOnTop(compact || s.alwaysOnTop).catch(() => undefined);
