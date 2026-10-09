@@ -56,6 +56,8 @@ export default function App() {
   const [modelsCatalog, setModelsCatalog] = useState<ModelOpt[]>([]);
   const [modelIdx, setModelIdx] = useState(0);
   const [flash, setFlash] = useState(false);
+  const [flashKey, setFlashKey] = useState(0);
+  const coverSwapTimer = useRef(0);
   const [hovered, setHovered] = useState(false);
   const [reactKey, setReactKey] = useState(0);
   const [cue, setCue] = useState<GestureCue | null>(null);
@@ -123,20 +125,25 @@ export default function App() {
           setModelIdx(idx);
         }
       }
+      window.clearTimeout(coverSwapTimer.current);
       setFlash(true);
+      // She stops, stands, grabs the hem and pulls her top up (CompanionVRM flash move).
+      setFlashKey((k) => k + 1);
       touchMood("happy");
-      fireCue("kiss");
       voice.speak(FLASH_LINES[Math.floor(Math.random() * FLASH_LINES.length)]!);
       return;
     }
     if (flashCmd === "off") {
       setFlash(false);
-      if (preFlashIdx.current != null) {
-        setModelIdx(preFlashIdx.current);
-        preFlashIdx.current = null;
-      }
+      // Let her lower the top on this model before swapping back to the previous one.
+      window.clearTimeout(coverSwapTimer.current);
+      coverSwapTimer.current = window.setTimeout(() => {
+        if (preFlashIdx.current != null) {
+          setModelIdx(preFlashIdx.current);
+          preFlashIdx.current = null;
+        }
+      }, 1600);
       touchMood("happy");
-      fireCue("kiss");
       voice.speak("Whatever. Clothes back on.");
       return;
     }
@@ -295,7 +302,7 @@ export default function App() {
       <button type="button" onClick={() => void getCurrentWindow().hide()} title="Hide to tray (Quit from the tray icon)">×</button>
     </div></header>
     <div className="companion-click-target" onClick={() => { setReactKey((k) => k + 1); bumpActivity(); if (compact) setChatOpen(true); }} title="Open companion chat">
-      <Companion mood={mood} name={name} compact={compact} modelUrl={modelsCatalog[modelIdx]?.file} flash={flash} roamAmount={roamAmount} roamPaused={roamPaused} reactKey={reactKey} cue={cue} playful={!!settings?.playful} />
+      <Companion mood={mood} name={name} compact={compact} modelUrl={modelsCatalog[modelIdx]?.file} flash={flash} flashKey={flashKey} roamAmount={roamAmount} roamPaused={roamPaused} reactKey={reactKey} cue={cue} playful={!!settings?.playful} />
     </div>
     {!compact && <StatusBar connection={connection} connectionMessage={connectionMessage} mood={mood} listening={voice.listening} speaking={voice.speaking} busy={chat.busy} wakeArmed={voice.wakeArmed} interim={voice.interim} />}
     {(!compact || chatOpen) && <div className={compact ? "compact-chat" : "full-chat"}>

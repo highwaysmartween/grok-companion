@@ -389,3 +389,82 @@ export async function visitDesktopIcon(
   const distance = Math.min(Math.abs(dx), dir > 0 ? room.right : room.left);
   return distance >= 40 ? { dir, distance, action: "pounce" } : null;
 }
+
+// --- "flash" (pull the top up) ------------------------------------------------
+
+/**
+ * Flash choreography (seconds). Both hands reach the hem at the waist, pull it
+ * up to the collarbone, hold with a giggle, lower it and let go — ≈ 4 s total.
+ */
+export const FLASH_TIMING = {
+  reach: 0.55,
+  lift: 0.75,
+  hold: 1.75,
+  lower: 0.6,
+  release: 0.45,
+};
+export const FLASH_DURATION =
+  FLASH_TIMING.reach + FLASH_TIMING.lift + FLASH_TIMING.hold + FLASH_TIMING.lower + FLASH_TIMING.release;
+
+export type FlashPhase = "reach" | "lift" | "hold" | "lower" | "release" | "done";
+
+export interface FlashFrame {
+  phase: FlashPhase;
+  /** Arm IK blend weight (0 = clip pose, 1 = hands on the hem). */
+  grip: number;
+  /** Hand target between hem (0) and collarbone (1); the top follows the hands. */
+  raise: number;
+  /** 0..1 inside the hold (giggle / expression envelope). */
+  hold: number;
+}
+
+/** Pure flash timeline: elapsed seconds → eased arm/hem envelopes. */
+export function flashFrame(elapsed: number): FlashFrame {
+  const T = FLASH_TIMING;
+  let e = Math.max(0, elapsed);
+  if (e < T.reach) return { phase: "reach", grip: smoothstep(e / T.reach), raise: 0, hold: 0 };
+  e -= T.reach;
+  if (e < T.lift) return { phase: "lift", grip: 1, raise: smoothstep(e / T.lift), hold: 0 };
+  e -= T.lift;
+  if (e < T.hold) return { phase: "hold", grip: 1, raise: 1, hold: e / T.hold };
+  e -= T.hold;
+  if (e < T.lower) return { phase: "lower", grip: 1, raise: 1 - smoothstep(e / T.lower), hold: 0 };
+  e -= T.lower;
+  if (e < T.release) return { phase: "release", grip: 1 - smoothstep(e / T.release), raise: 0, hold: 0 };
+  return { phase: "done", grip: 0, raise: 0, hold: 0 };
+}
+
+/**
+ * "Cover up" mid-flash: jump to the lowering phase from the current hem height
+ * (never snaps). Returns the new elapsed time to continue the timeline from.
+ */
+export function flashCoverUpElapsed(elapsed: number): number {
+  const T = FLASH_TIMING;
+  const lowerAt = T.reach + T.lift + T.hold;
+  const f = flashFrame(elapsed);
+  if (f.phase === "reach") return lowerAt + T.lower + T.release * (1 - f.grip);
+  if (f.phase === "lift" || f.phase === "hold") {
+    // Find the point in "lower" with the same hem height.
+    const r = f.raise;
+    let lo = 0;
+    let hi = 1;
+    for (let i = 0; i < 20; i++) {
+      const mid = (lo + hi) / 2;
+      if (1 - smoothstep(mid) > r) lo = mid;
+      else hi = mid;
+    }
+    return lowerAt + T.lower * lo;
+  }
+  return elapsed;
+}
+
+/** What has to happen before she can flash: never mid-walk, seated or lying. */
+export type FlashPrep = "ready" | "stopStroll" | "standUp" | "getUp" | "wait";
+
+export function flashPrep(s: { posture: "stand" | "sit" | "lie"; strolling: boolean; transition: boolean }): FlashPrep {
+  if (s.strolling) return "stopStroll";
+  if (s.transition) return "wait";
+  if (s.posture === "lie") return "getUp";
+  if (s.posture === "sit") return "standUp";
+  return "ready";
+}

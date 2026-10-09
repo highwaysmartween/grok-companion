@@ -11,6 +11,8 @@ interface Props {
   compact?: boolean;
   modelUrl?: string;
   flash?: boolean;
+  /** Bump to play the flash move once. */
+  flashKey?: number;
   /** Off / Calm / Lively. Off = she never walks (idle / look / turn still run). */
   roamAmount?: RoamAmount;
   /** Temporarily hold still (hovered, chat open, tray pause…). */
@@ -162,6 +164,7 @@ export function Companion({
   compact,
   modelUrl,
   flash,
+  flashKey = 0,
   roamAmount = "calm",
   roamPaused = false,
   reactKey = 0,
@@ -189,6 +192,7 @@ export function Companion({
           className="pet-3d"
           modelUrl={modelUrl}
           flash={flash}
+          flashKey={flashKey}
           roamAmount={roamAmount}
           roamAllowed={!roamPaused && roamAmount !== "off"}
           reactKey={reactKey}
