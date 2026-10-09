@@ -17,7 +17,7 @@ use crate::proc;
 use serde::Serialize;
 use std::io::{BufRead, BufReader};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
@@ -29,6 +29,8 @@ pub struct SttState {
     /// PID of the active manual (tap-to-talk) PowerShell (0 = none).
     pub listen_pid: AtomicU32,
     pub listen_gen: AtomicU64,
+    /// 0 = untested, 1 = Whisper works, 2 = Whisper unavailable (use System.Speech).
+    pub whisper: AtomicU8,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +66,82 @@ fn sanitize_phrase(s: &str) -> String {
 
 fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+// --- Whisper (preferred) ------------------------------------------------------
+//
+// The System.Speech desktop recogniser is a 2006-era engine: on this kind of
+// laptop mic it turns "hey Nova, what's the weather" into "if to have it has"
+// and rejects the bare wake word. When Python + faster-whisper are installed we
+// run `whisper_stt.py` instead (fully offline, same READY/WAKE/TEXT protocol)
+// and only fall back to System.Speech if it is unavailable (exit 3).
+
+const WHISPER_PY: &str = include_str!("whisper_stt.py");
+const WHISPER_UNAVAILABLE: i32 = 3;
+
+fn python_candidates() -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let base = std::path::PathBuf::from(local)
+            .join("Programs")
+            .join("Python");
+        if let Ok(rd) = std::fs::read_dir(&base) {
+            let mut dirs: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+            dirs.sort();
+            dirs.reverse(); // newest PythonNNN first
+            for d in dirs {
+                let exe = d.join("python.exe");
+                if exe.is_file() {
+                    out.push(vec![exe.to_string_lossy().to_string()]);
+                }
+            }
+        }
+    }
+    out.push(vec!["py".into(), "-3".into()]);
+    out.push(vec!["python".into()]);
+    out
+}
+
+fn whisper_command(args: &[String]) -> Option<(std::process::Command, proc::TempFile)> {
+    let path = proc::temp_file("whisper", "py");
+    std::fs::write(&path, WHISPER_PY).ok()?;
+    let guard = proc::TempFile(path.clone());
+    // First launcher that exists on disk / resolves; failures surface as exit codes.
+    let launcher = python_candidates().into_iter().find(|c| {
+        let p = std::path::Path::new(&c[0]);
+        p.is_absolute() && p.is_file() || !p.is_absolute()
+    })?;
+    let mut cmd = proc::command(&launcher[0]);
+    cmd.args(&launcher[1..])
+        .arg("-u")
+        .arg(&path)
+        .args(args)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUNBUFFERED", "1")
+        .env("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+        .env("HF_HUB_DISABLE_PROGRESS_BARS", "1");
+    Some((cmd, guard))
+}
+
+fn whisper_allowed(st: &SttState) -> bool {
+    cfg!(windows) && st.whisper.load(Ordering::SeqCst) != 2
+}
+
+fn note_whisper(st: &SttState, code: i32, stderr: &str) {
+    if code == WHISPER_UNAVAILABLE {
+        eprintln!("[stt] whisper unavailable, using System.Speech: {stderr}");
+        st.whisper.store(2, Ordering::SeqCst);
+    } else if code == 0 || code == 1 {
+        st.whisper.store(1, Ordering::SeqCst);
+    }
+}
+
+/// Last `TEXT:` line of the helper's stdout.
+fn text_line(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("TEXT:").map(|t| t.trim().to_string()))
 }
 
 const ENGINE_PRELUDE: &str = r#"
@@ -114,9 +192,16 @@ fn run_ps_file_tracked(
     std::fs::write(&path, script).map_err(|e| format!("Could not write STT script: {e}"))?;
     let _guard = proc::TempFile(path.clone());
     let mut cmd = proc::command("powershell");
-    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&path);
-    let output = proc::run_tracked_checked(cmd, slot, still_wanted).map_err(|e| format!("Could not start Windows speech: {e}"))?;
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+    ])
+    .arg(&path);
+    let output = proc::run_tracked_checked(cmd, slot, still_wanted)
+        .map_err(|e| format!("Could not start Windows speech: {e}"))?;
     Ok((
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stdout).trim().to_string(),
@@ -139,6 +224,35 @@ pub async fn stt_listen_windows(
     let st2 = Arc::clone(&st);
     let (code, stdout, stderr) = tauri::async_runtime::spawn_blocking(move || {
         let wanted = || st2.listen_gen.load(Ordering::SeqCst) == gen;
+        if whisper_allowed(&st2) {
+            if let Some((cmd, _guard)) =
+                whisper_command(&["listen".into(), "--secs".into(), secs.to_string()])
+            {
+                match proc::run_tracked_checked(cmd, &st2.listen_pid, &wanted) {
+                    Ok(o) => {
+                        let code = o.status.code().unwrap_or(-1);
+                        let out = String::from_utf8_lossy(&o.stdout).to_string();
+                        let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                        note_whisper(&st2, code, &err);
+                        if code != WHISPER_UNAVAILABLE {
+                            let text = if code == 0 {
+                                text_line(&out).unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+                            return Ok((code, text, err));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[stt] could not start whisper: {e}");
+                        st2.whisper.store(2, Ordering::SeqCst);
+                    }
+                }
+                if !wanted() {
+                    return Ok((0, String::new(), String::new()));
+                }
+            }
+        }
         run_ps_file_tracked(&listen_script(secs), &st2.listen_pid, &wanted)
     })
     .await
@@ -154,7 +268,7 @@ pub async fn stt_listen_windows(
             stderr
         };
         return Err(format!(
-            "Windows speech failed: {detail}. Check mic privacy (Settings → Privacy → Microphone) and that English speech is installed."
+            "Speech recognition failed: {detail}. Check mic privacy (Settings → Privacy → Microphone)."
         ));
     }
     if stdout.is_empty() {
@@ -174,7 +288,11 @@ pub async fn stt_cancel_listen(state: State<'_, Arc<SttState>>) -> Result<(), St
 }
 
 fn wake_script(phrases: &[String], head: &str, min_conf: f32, command_secs: u32) -> String {
-    let list = phrases.iter().map(|p| ps_quote(p)).collect::<Vec<_>>().join(",");
+    let list = phrases
+        .iter()
+        .map(|p| ps_quote(p))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         r#"{ENGINE_PRELUDE}
 try {{
@@ -280,55 +398,48 @@ pub async fn stt_wait_wake_word(
 
     let st2 = Arc::clone(&st);
     let app2 = app.clone();
+    let whisper_args: Vec<String> = vec![
+        "wake".into(),
+        "--secs".into(),
+        "480".into(),
+        "--command-secs".into(),
+        "10".into(),
+        "--name".into(),
+        name.clone(),
+    ];
     let (code, text, heard, stderr) = tauri::async_runtime::spawn_blocking(move || {
-        let path = proc::temp_file("wake", "ps1");
-        std::fs::write(&path, &script).map_err(|e| format!("Could not write wake script: {e}"))?;
-        let _guard = proc::TempFile(path.clone());
-        let mut child = proc::command("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
-            .arg(&path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Could not start wake listener: {e}"))?;
-        let pid = child.id();
-        st2.wake_pid.store(pid, Ordering::SeqCst);
-        if st2.wake_gen.load(Ordering::SeqCst) != gen {
-            // stt_cancel_wake raced the spawn (e.g. TTS started) — don't hold the mic.
-            proc::kill_tree(pid);
-        }
-
-        let err_handle = child.stderr.take().map(|mut e| {
-            std::thread::spawn(move || {
-                let mut b = String::new();
-                let _ = std::io::Read::read_to_string(&mut e, &mut b);
-                b
-            })
-        });
-        let mut heard = false;
-        let mut text = String::new();
-        if let Some(out) = child.stdout.take() {
-            for line in BufReader::new(out).lines() {
-                let Ok(line) = line else { break };
-                let line = line.trim();
-                if line == "READY" {
-                    let _ = app2.emit("stt-wake-ready", ());
-                } else if line == "WAKE" {
-                    heard = true;
-                    let _ = app2.emit("stt-wake", ());
-                } else if let Some(rest) = line.strip_prefix("TEXT:") {
-                    text = rest.trim().to_string();
+        if whisper_allowed(&st2) {
+            if let Some((cmd, _guard)) = whisper_command(&whisper_args) {
+                match run_wake_child(cmd, &st2, gen, &app2) {
+                    Ok(r) => {
+                        note_whisper(&st2, r.0, &r.3);
+                        if r.0 != WHISPER_UNAVAILABLE || r.2 {
+                            return Ok(r);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[stt] could not start whisper wake: {e}");
+                        st2.whisper.store(2, Ordering::SeqCst);
+                    }
+                }
+                if st2.wake_gen.load(Ordering::SeqCst) != gen {
+                    return Ok((0, String::new(), false, String::new()));
                 }
             }
         }
-        let status = child.wait();
-        let _ = st2
-            .wake_pid
-            .compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
-        let stderr = err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
-        let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
-        Ok::<_, String>((code, text, heard, stderr.trim().to_string()))
+        let path = proc::temp_file("wake", "ps1");
+        std::fs::write(&path, &script).map_err(|e| format!("Could not write wake script: {e}"))?;
+        let _guard = proc::TempFile(path.clone());
+        let mut cmd = proc::command("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&path);
+        run_wake_child(cmd, &st2, gen, &app2)
     })
     .await
     .map_err(|e| format!("Wake-word task failed: {e}"))??;
@@ -359,6 +470,59 @@ pub async fn stt_wait_wake_word(
             stderr.chars().take(240).collect()
         }
     ))
+}
+
+/// Spawn a wake listener (Whisper or System.Speech), forward READY/WAKE as
+/// events, and return (exit code, command text, heard wake word, stderr).
+fn run_wake_child(
+    mut cmd: std::process::Command,
+    st2: &SttState,
+    gen: u64,
+    app2: &AppHandle,
+) -> Result<(i32, String, bool, String), String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Could not start wake listener: {e}"))?;
+    let pid = child.id();
+    st2.wake_pid.store(pid, Ordering::SeqCst);
+    if st2.wake_gen.load(Ordering::SeqCst) != gen {
+        // stt_cancel_wake raced the spawn (e.g. TTS started) — don't hold the mic.
+        proc::kill_tree(pid);
+    }
+
+    let err_handle = child.stderr.take().map(|mut e| {
+        std::thread::spawn(move || {
+            let mut b = String::new();
+            let _ = std::io::Read::read_to_string(&mut e, &mut b);
+            b
+        })
+    });
+    let mut heard = false;
+    let mut text = String::new();
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line == "READY" {
+                let _ = app2.emit("stt-wake-ready", ());
+            } else if line == "WAKE" {
+                heard = true;
+                let _ = app2.emit("stt-wake", ());
+            } else if let Some(rest) = line.strip_prefix("TEXT:") {
+                text = rest.trim().to_string();
+            }
+        }
+    }
+    let status = child.wait();
+    let _ = st2
+        .wake_pid
+        .compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+    let stderr = err_handle.and_then(|h| h.join().ok()).unwrap_or_default();
+    let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
+    Ok((code, text, heard, stderr.trim().to_string()))
 }
 
 #[tauri::command]
