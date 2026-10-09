@@ -3,10 +3,10 @@
 //! Wake word design (v1.1.1):
 //! * Grammar is only the wake phrase ("hey", "hey <name>") — the old free-dictation
 //!   backup grammar matched almost any speech and caused false triggers.
-//! * A second grammar "hey <dictation>" lets "hey what's up" arrive in one breath:
-//!   the wake word's own word-confidence is checked, the rest is the command.
+//! * No "hey <dictation>" grammar: it out-scored the wake grammar on every real
+//!   utterance and the result was rejected, so the wake word never fired.
 //! * Confidence: engine rejection threshold raised (20 → 45) and the script also
-//!   requires the wake word confidence ≥ `min_confidence` (default 0.6).
+//!   requires the wake word confidence ≥ `min_confidence` (default 0.45).
 //! * After a bare "hey" the SAME warm engine switches to dictation immediately
 //!   (no new PowerShell / engine spin-up), so the first words aren't lost. The
 //!   script prints `WAKE` the moment it hears the wake word; Rust forwards that
@@ -311,52 +311,53 @@ try {{
   $gWake.Name = 'wake'
   $eng.LoadGrammar($gWake)
 
-  $gbCmd = New-Object System.Speech.Recognition.GrammarBuilder
-  $gbCmd.Culture = $culture
-  $gbCmd.Append($choices)
-  $gbCmd.AppendDictation()
-  $gCmd = New-Object System.Speech.Recognition.Grammar($gbCmd)
-  $gCmd.Name = 'wakecmd'
-  $eng.LoadGrammar($gCmd)
+  # No "hey <dictation>" grammar: on real mics it out-scored the wake grammar on
+  # every utterance ("hey have an", conf 0.00) and got rejected, so "hey nova"
+  # never fired. Bare wake grammar → dictation on the same warm engine instead.
 
-  $eng.InitialSilenceTimeout = [TimeSpan]::FromSeconds(4)
   $eng.BabbleTimeout = [TimeSpan]::FromSeconds(4)
   $eng.EndSilenceTimeout = [TimeSpan]::FromSeconds(0.6)
+  # Continuous async recognition. The old one-shot Recognize(6s) loop never
+  # returned the wake phrase on the Conexant laptop mic (its noise floor keeps
+  # the engine "in speech" until the timeout); RecognizeAsync(Multiple) hears it.
+  $global:wq = [Collections.Queue]::Synchronized((New-Object Collections.Queue))
+  $null = Register-ObjectEvent -InputObject $eng -EventName SpeechRecognized -SourceIdentifier 'wk' -Action {{ $global:wq.Enqueue($EventArgs.Result) }}
+  $eng.RecognizeAsync([System.Speech.Recognition.RecognizeMode]::Multiple)
   [Console]::Out.WriteLine('READY'); [Console]::Out.Flush()
 
   $minConf = {min_conf}
   $deadline = (Get-Date).AddMinutes(8)
+  $woke = $false
   while ((Get-Date) -lt $deadline) {{
-    $r = $eng.Recognize([TimeSpan]::FromSeconds(6))
+    if ($global:wq.Count -eq 0) {{ Start-Sleep -Milliseconds 100; continue }}
+    $r = $global:wq.Dequeue()
     if ($null -eq $r -or $r.Words.Count -eq 0) {{ continue }}
-    $first = $r.Words[0]
-    if ($first.Text.ToLowerInvariant() -ne '{head}') {{ continue }}
-    if ($r.Grammar.Name -eq 'wake') {{
-      if ($r.Confidence -lt $minConf) {{ continue }}
-      [Console]::Out.WriteLine('WAKE'); [Console]::Out.Flush()
-      # Same warm engine → dictation right away so the first words aren't lost.
-      $eng.UnloadAllGrammars()
-      $eng.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))
-      $eng.InitialSilenceTimeout = [TimeSpan]::FromSeconds(6)
-      $eng.BabbleTimeout = [TimeSpan]::FromSeconds(8)
-      $eng.EndSilenceTimeout = [TimeSpan]::FromSeconds(1.1)
-      $c = $eng.Recognize([TimeSpan]::FromSeconds({command_secs}))
-      if ($null -ne $c -and -not [string]::IsNullOrWhiteSpace($c.Text)) {{
-        [Console]::Out.WriteLine('TEXT:' + $c.Text.Trim())
-      }} else {{
-        [Console]::Out.WriteLine('TEXT:')
-      }}
-      [Console]::Out.Flush()
-      exit 0
-    }}
-    # "hey <dictation>": judge the wake word itself, not the free text after it.
-    if ($first.Confidence -lt $minConf -or $r.Words.Count -lt 2) {{ continue }}
-    [Console]::Out.WriteLine('WAKE')
-    [Console]::Out.WriteLine('TEXT:' + $r.Text.Trim())
-    [Console]::Out.Flush()
-    exit 0
+    [Console]::Out.WriteLine('HEARD:' + $r.Text + ' conf=' + [Math]::Round($r.Confidence, 2)); [Console]::Out.Flush()
+    if ($r.Words[0].Text.ToLowerInvariant() -ne '{head}') {{ continue }}
+    if ($r.Confidence -lt $minConf) {{ continue }}
+    $woke = $true
+    break
   }}
-  exit 1
+  $eng.RecognizeAsyncCancel()
+  Unregister-Event -SourceIdentifier 'wk' -ErrorAction SilentlyContinue
+  if (-not $woke) {{ exit 1 }}
+  [Console]::Out.WriteLine('WAKE'); [Console]::Out.Flush()
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  while ([string]$eng.AudioState -ne 'Stopped' -and $sw.ElapsedMilliseconds -lt 1500) {{ Start-Sleep -Milliseconds 20 }}
+  # Same warm engine → dictation right away so the first words aren't lost.
+  $eng.UnloadAllGrammars()
+  $eng.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))
+  $eng.InitialSilenceTimeout = [TimeSpan]::FromSeconds(6)
+  $eng.BabbleTimeout = [TimeSpan]::FromSeconds(8)
+  $eng.EndSilenceTimeout = [TimeSpan]::FromSeconds(1.1)
+  $c = $eng.Recognize([TimeSpan]::FromSeconds({command_secs}))
+  if ($null -ne $c -and -not [string]::IsNullOrWhiteSpace($c.Text)) {{
+    [Console]::Out.WriteLine('TEXT:' + $c.Text.Trim())
+  }} else {{
+    [Console]::Out.WriteLine('TEXT:')
+  }}
+  [Console]::Out.Flush()
+  exit 0
 }} catch {{
   [Console]::Error.WriteLine($_.Exception.Message)
   exit 2
@@ -393,7 +394,9 @@ pub async fn stt_wait_wake_word(
     if !name.is_empty() && !wake.ends_with(&name) {
         phrases.push(format!("{wake} {name}"));
     }
-    let min_conf = min_confidence.unwrap_or(0.6).clamp(0.3, 0.95);
+    // Measured on the Conexant laptop mic: real "hey nova" scores 0.56–0.79,
+    // so 0.6 dropped about half of them. Engine rejection (45) still filters noise.
+    let min_conf = min_confidence.unwrap_or(0.45).clamp(0.3, 0.95);
     let script = wake_script(&phrases, &head.replace('\'', "''"), min_conf, 10);
 
     let st2 = Arc::clone(&st);
