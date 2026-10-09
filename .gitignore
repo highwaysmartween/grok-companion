@@ -38,3 +38,4 @@ src-tauri/gen
 # OS
 Thumbs.db
 Desktop.ini
+__pycache__/
