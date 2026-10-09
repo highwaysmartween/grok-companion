@@ -147,6 +147,7 @@ fn text_line(stdout: &str) -> Option<String> {
 const ENGINE_PRELUDE: &str = r#"
 Add-Type -AssemblyName System.Speech
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
 function New-Engine {
   try {
     $c = [Globalization.CultureInfo]::GetCultureInfo('en-US')
@@ -506,8 +507,10 @@ fn run_wake_child(
     let mut heard = false;
     let mut text = String::new();
     if let Some(out) = child.stdout.take() {
-        for line in BufReader::new(out).lines() {
+        // Lossy per line: one non-UTF-8 byte must not drop the TEXT: line.
+        for line in BufReader::new(out).split(b'\n') {
             let Ok(line) = line else { break };
+            let line = String::from_utf8_lossy(&line);
             let line = line.trim();
             if line == "READY" {
                 let _ = app2.emit("stt-wake-ready", ());

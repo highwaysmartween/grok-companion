@@ -274,7 +274,7 @@ export default function App() {
     }
   };
   const sendTyped = () => { const text = input.trim(); if (!text) return; setInput(""); void handleUserText(text); };
-  const wakeHint = voice.listening ? voice.interim || "Listening…" : voice.wakeArmed ? "Say “hey”…" : voice.speaking ? "Speaking…" : null;
+  const wakeHint = voice.listening ? voice.interim || "Listening…" : voice.wakeArmed ? "Say “hey”…" : voice.speaking ? "Speaking…" : voice.wakeStatus ? "“hey” isn't working — tap to talk" : null;
   // Tray "Pause roaming" clears roamEnabled; the amount itself is kept.
   const roamAmount = settings && settings.roamEnabled !== false ? normalizeRoamAmount(settings.roamAmount) : "off";
   const roamPaused = !compact || chatOpen || settingsOpen || hovered;

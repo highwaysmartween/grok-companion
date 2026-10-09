@@ -129,17 +129,22 @@ fn play_script(path: &str) -> String {
     let path = path.replace('\'', "''");
     format!(
         r#"
+$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName presentationCore
 $p = New-Object System.Windows.Media.MediaPlayer
-$p.Open([Uri]'{path}')
+$p.Open([Uri]::new('{path}'))
 $sw = [Diagnostics.Stopwatch]::StartNew()
 while (-not $p.NaturalDuration.HasTimeSpan) {{
   Start-Sleep -Milliseconds 30
   if ($sw.ElapsedMilliseconds -gt 6000) {{ break }}
 }}
+if (-not $p.NaturalDuration.HasTimeSpan) {{
+  [Console]::Error.WriteLine('MediaPlayer could not open the voice file')
+  exit 3
+}}
 $p.Volume = 1
 $p.Play()
-$dur = if ($p.NaturalDuration.HasTimeSpan) {{ $p.NaturalDuration.TimeSpan.TotalMilliseconds }} else {{ 15000 }}
+$dur = $p.NaturalDuration.TimeSpan.TotalMilliseconds
 $sw.Restart()
 while ($sw.ElapsedMilliseconds -lt ($dur + 150)) {{
   Start-Sleep -Milliseconds 60
@@ -186,7 +191,10 @@ fn speak_blocking(state: &TtsState, text: String, voice: Option<String>) -> Resu
         return Ok("stopped".into());
     }
 
-    let path = out.0.canonicalize().unwrap_or(out.0.clone());
+    // NOT canonicalize(): on Windows that returns `\\?\C:\...`, which [Uri] rejects
+    // ("hostname could not be parsed") so MediaPlayer never opens and she is silent.
+    // temp_dir() is already absolute.
+    let path = out.0.clone();
     let mut cmd = proc::command("powershell");
     cmd.args([
         "-NoProfile",
@@ -202,7 +210,10 @@ fn speak_blocking(state: &TtsState, text: String, voice: Option<String>) -> Resu
     }
     match res {
         Ok(o) if o.status.success() => Ok("done".into()),
-        Ok(_) => Err("Playback ended unexpectedly.".into()),
+        Ok(o) => Err(format!(
+            "Playback failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim().chars().take(200).collect::<String>()
+        )),
         Err(e) => Err(format!("Could not play voice: {e}")),
     }
 }

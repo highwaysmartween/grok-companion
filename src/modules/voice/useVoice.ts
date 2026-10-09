@@ -90,6 +90,7 @@ export function useVoice(opts: UseVoiceOptions) {
   const playingIdRef = useRef<number | null>(null);
   const speakingRef = useRef(false);
   const quietUntilRef = useRef(0);
+  const liveUtterRef = useRef<SpeechSynthesisUtterance | null>(null);
 
   const setSpeakingState = useCallback((v: boolean) => {
     speakingRef.current = v;
@@ -118,21 +119,35 @@ export function useVoice(opts: UseVoiceOptions) {
   }, []);
 
   const speakOne = useCallback(async (text: string, epoch: number) => {
+    let naturalErr = "";
     try {
       await speakNatural(text, optsRef.current.voice || DEFAULT_NEURAL_VOICE);
       return;
-    } catch {
+    } catch (err) {
+      naturalErr = errText(err);
+      console.warn("[voice] natural TTS failed, using Web Speech:", naturalErr);
       if (epoch !== speakEpoch.current) return;
     }
     // Natural voice unavailable (no edge-tts / offline / not Windows) → Web Speech.
     try {
       await new Promise<void>((resolve, reject) => {
         const utter = speakRaw(text, { voice: pickVoice(voicesRef.current), rate: 0.98 });
-        utter.onend = () => resolve();
-        utter.onerror = (ev) => (ev.error === "interrupted" || ev.error === "canceled" ? resolve() : reject(new Error("web speech failed")));
+        liveUtterRef.current = utter; // Chromium drops onend for GC'd utterances
+        // Never let a lost onend pin `speaking` (which also blocks the wake loop).
+        const watchdog = window.setTimeout(resolve, 4_000 + text.length * 120);
+        utter.onend = () => { window.clearTimeout(watchdog); resolve(); };
+        utter.onerror = (ev) => {
+          window.clearTimeout(watchdog);
+          if (ev.error === "interrupted" || ev.error === "canceled") resolve();
+          else reject(new Error(`Web Speech failed (${ev.error})`));
+        };
       });
     } catch (err) {
-      if (epoch === speakEpoch.current) setError(errText(err) || "Could not speak.");
+      if (epoch === speakEpoch.current) {
+        setError(`Can't speak: ${naturalErr || "natural voice unavailable"}; ${errText(err)}`);
+      }
+    } finally {
+      liveUtterRef.current = null;
     }
   }, []);
 
@@ -254,10 +269,13 @@ export function useVoice(opts: UseVoiceOptions) {
       if (!browserSttBrokenRef.current && getSpeechRecognitionCtor()) {
         let gotFinal = false;
         let fellBack = false;
+        let heardAnything = false;
+        let reportedError = false;
         const handle = startRecognition({
           lang: optsRef.current.lang ?? navigator.language ?? "en-US",
           onInterim: (text) => {
             if (gen !== listenGen.current) return;
+            heardAnything = true;
             setInterim(text || "Listening…");
           },
           onFinal: (text) => {
@@ -279,6 +297,7 @@ export function useVoice(opts: UseVoiceOptions) {
               runOfflineListen(gen);
               return;
             }
+            reportedError = true;
             micOwnerRef.current = "idle";
             setListening(false);
             setInterim("");
@@ -287,6 +306,13 @@ export function useVoice(opts: UseVoiceOptions) {
           onEnd: () => {
             if (gen !== listenGen.current || fellBack || gotFinal) return;
             browserRecognitionRef.current = null;
+            if (!heardAnything && !reportedError) {
+              // WebView2 often "starts" then ends silently (no backend) → offline engine.
+              browserSttBrokenRef.current = true;
+              fellBack = true;
+              runOfflineListen(gen);
+              return;
+            }
             micOwnerRef.current = "idle";
             setListening(false);
             setInterim("");
@@ -334,7 +360,7 @@ export function useVoice(opts: UseVoiceOptions) {
     let unlisten: (() => void) | undefined;
     let disposed = false;
     void listen("stt-wake", () => {
-      if (!wakeArmedRef.current || micOwnerRef.current !== "idle") return;
+      if (!wakePendingRef.current || micOwnerRef.current !== "idle") return;
       micOwnerRef.current = "wake";
       setArmed(false);
       setListening(true);
@@ -412,7 +438,10 @@ export function useVoice(opts: UseVoiceOptions) {
           await sleep(150);
           continue;
         }
-        if (outcome.status === "timeout") continue;
+        if (outcome.status === "timeout") {
+          setArmed(false);
+          continue;
+        }
 
         // Wake heard.
         const owned = owner() === "wake" || owner() === "idle";
