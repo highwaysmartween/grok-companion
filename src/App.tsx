@@ -313,7 +313,7 @@ export default function App() {
       </button>
     </div>}
     {voice.error && <p className="banner">{voice.error}</p>}{chat.error && <p className="banner">{chat.error}</p>}
-    {voice.wakeStatus && (!compact || hovered) && <p className="banner subtle">{voice.wakeStatus}</p>}
+    {voice.wakeStatus && <p className="banner subtle">{voice.wakeStatus}</p>}
     {settingsOpen && settings && <SettingsPanel
       settings={settings}
       models={models}

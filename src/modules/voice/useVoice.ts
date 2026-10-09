@@ -31,7 +31,13 @@ export interface UseVoiceOptions {
 }
 
 /** Browser SpeechRecognition errors that mean "this engine won't work here" → use offline Windows STT. */
-const BROWSER_STT_FATAL = new Set(["network", "not-allowed", "service-not-allowed", "language-not-supported", "unsupported", "start-failed"]);
+const BROWSER_STT_FATAL = new Set(["network", "not-allowed", "service-not-allowed", "language-not-supported", "unsupported", "start-failed", "audio-capture"]);
+/**
+ * WebView2 exposes webkitSpeechRecognition but has no speech backend: it either
+ * errors ("network") or ends silently with nothing — so on Windows tap-to-talk
+ * goes straight to the offline System.Speech recogniser (same engine as "hey").
+ */
+const IS_WINDOWS = typeof navigator !== "undefined" && /windows/i.test(navigator.userAgent);
 /** Don't re-arm the wake listener until her own voice has fully died away. */
 const SPEECH_TAIL_MS = 700;
 const WAKE_BACKOFF_MIN_MS = 1_000;
@@ -64,7 +70,9 @@ export function useVoice(opts: UseVoiceOptions) {
 
   const browserRecognitionRef = useRef<{ stop: () => void; abort: () => void } | null>(null);
   const offlineListenRef = useRef(false);
-  const browserSttBrokenRef = useRef(false);
+  const browserSttBrokenRef = useRef(IS_WINDOWS);
+  /** True while a wake listener call is in flight (armed only once the backend says READY). */
+  const wakePendingRef = useRef(false);
   const listenGen = useRef(0);
   const wakeGen = useRef(0);
   const micOwnerRef = useRef<MicOwner>("idle");
@@ -307,6 +315,24 @@ export function useVoice(opts: UseVoiceOptions) {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let disposed = false;
+    void listen("stt-wake-ready", () => {
+      if (!wakePendingRef.current || micOwnerRef.current !== "idle" || speakingRef.current) return;
+      setArmed(true);
+    })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [setArmed]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
     void listen("stt-wake", () => {
       if (!wakeArmedRef.current || micOwnerRef.current !== "idle") return;
       micOwnerRef.current = "wake";
@@ -354,21 +380,26 @@ export function useVoice(opts: UseVoiceOptions) {
           await sleep(200);
           continue;
         }
-        setArmed(true);
+        // "Say hey…" is only shown once the recogniser is really listening
+        // (backend emits stt-wake-ready) — not while it may be failing to start.
+        wakePendingRef.current = true;
         let outcome;
         try {
           outcome = await waitWakeWord({ word, name });
         } catch (err) {
+          wakePendingRef.current = false;
           if (gen !== wakeGen.current) return;
           setArmed(false);
           backoff = backoff ? Math.min(backoff * 2, WAKE_BACKOFF_MAX_MS) : WAKE_BACKOFF_MIN_MS;
           if (!reported) {
             reported = true;
-            setWakeStatus(`“${word}” wake word unavailable (${errText(err)}). Retrying quietly — tap to talk still works.`);
+            setWakeStatus(`Can't hear “${word}”: ${errText(err)}`);
+            console.warn("[voice] wake listener failed", err);
           }
           await sleep(backoff);
           continue;
         }
+        wakePendingRef.current = false;
         if (gen !== wakeGen.current) return;
         backoff = 0;
         if (reported) {
