@@ -29,3 +29,6 @@ body { font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif; colo
 .compact-chat::before { content:"Chat · Esc to close"; position:absolute; left:16px; top:13px; font-size:11px; letter-spacing:.06em; color:rgba(180,210,230,.7); }
 .is-compact .companion-click-target { cursor:grab; }
 .is-compact .companion-click-target:active { cursor:grabbing; }
+html, body, #root { overflow: clip; }
+.pet-3d-wrap canvas { width: 100% !important; height: 100% !important; display: block; }
+.is-compact.chat-open .compact-chat { display:flex; flex-direction:column; }

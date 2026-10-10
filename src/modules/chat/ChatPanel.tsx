@@ -34,7 +34,11 @@ export function ChatPanel({
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    // Scroll only the transcript. scrollIntoView also scrolled the page itself
+    // (html has overflow:hidden, which can still scroll), pushing her and the
+    // panel out of the window.
+    const box = endRef.current?.parentElement;
+    if (box) box.scrollTo({ top: box.scrollHeight, behavior: "smooth" });
   }, [messages, interim, busy]);
 
   const submit = (e: FormEvent) => {

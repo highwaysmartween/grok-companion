@@ -34,7 +34,68 @@ def norm(t):
     return re.sub(r"[^a-z' ]+", " ", t.lower()).split()
 
 
-WAKE_ALIASES = {"hey", "hay", "heyy", "hei", "heya", "hey,"}
+WAKE_ALIASES = {"hey", "hay", "heyy", "hei", "heya", "hey,", "a", "ah", "and", "an", "okay", "ok", "hi"}
+# How Whisper tends to hear "Nova" on a quiet laptop mic.
+NAME_ALIASES = {"nova", "noah", "nover", "novah", "nava", "noba", "novo", "nora", "knova", "innova", "anova"}
+
+
+def match_wake(words, name):
+    """Remaining words if the utterance STARTS with the wake phrase, else None.
+    Requiring it at the very start keeps movie/TV dialogue from waking her."""
+    if not words:
+        return None
+    names = set(NAME_ALIASES)
+    if name:
+        names.add(name[0])
+    w = words[:]
+    if w[0] in ("anova", "annova"):  # "a nova" glued together
+        return w[1:]
+    if w[0] not in WAKE_ALIASES:
+        return None
+    w = w[1:]
+    if w and w[0] in ("there", "hey"):
+        w = w[1:]
+    if not w or w[0] not in names:
+        return None
+    return w[1:]
+
+
+def spectral_gate(audio, noise):
+    """Light noise suppression: subtract the room's noise spectrum (from the
+    pre-speech blocks) and gate bins that stay under it."""
+    if noise is None or len(noise) < 1024 or len(audio) < 1024:
+        return audio
+    n, hop = 512, 256
+    win = np.hanning(n).astype(np.float32)
+
+    def stft(x):
+        frames = 1 + (len(x) - n) // hop
+        idx = np.arange(n)[None, :] + hop * np.arange(frames)[:, None]
+        return np.fft.rfft(x[idx] * win, axis=1)
+
+    noise_mag = np.abs(stft(noise)).mean(axis=0)
+    spec = stft(audio)
+    mag = np.abs(spec)
+    gain = np.clip((mag - 1.5 * noise_mag) / (mag + 1e-9), 0.0, 1.0)
+    gain = np.maximum(gain, 0.12)  # keep a little floor: no "underwater" artefacts
+    frames = np.fft.irfft(spec * gain, n=n, axis=1) * win
+    outp = np.zeros(hop * (len(frames) - 1) + n, dtype=np.float32)
+    norm_w = np.zeros_like(outp)
+    for i, f in enumerate(frames):
+        outp[i * hop:i * hop + n] += f
+        norm_w[i * hop:i * hop + n] += win * win
+    outp /= np.maximum(norm_w, 1e-3)
+    return outp[: len(audio)].astype(np.float32)
+
+
+def agc(audio):
+    """Automatic gain: bring speech to a steady level whatever the mic gain is
+    (the internal Conexant mic has no hardware gain dial)."""
+    loud = np.sort(np.abs(audio))[int(len(audio) * 0.995)] if len(audio) else 0.0
+    if loud <= 1e-5:
+        return audio
+    g = min(0.5 / loud, 40.0)
+    return np.clip(audio * g, -1.0, 1.0)
 # Whisper's stock hallucinations on breath / noise.
 JUNK = {"", "you", "thank you", "thanks for watching", "bye", "thank you for watching", "so", "uh", "um", "hmm"}
 
@@ -46,6 +107,8 @@ class Mic:
                                      callback=lambda d, f, t, s: self.q.put(d[:, 0].copy()))
         self.stream.start()
         self.floor = 0.004
+        self.noise = []  # recent quiet blocks (noise profile for the gate)
+        self.last_noise = None
 
     def flush(self):
         """Drop audio captured while nobody was listening (e.g. her own voice)."""
@@ -67,16 +130,22 @@ class Mic:
             except queue.Empty:
                 continue
             rms = float(np.sqrt(np.mean(b * b)) + 1e-9)
-            thr = max(self.floor * 3.0, 0.006)
+            # More sensitive than before: 2.5x the floor, absolute minimum lowered
+            # for the quiet internal mic.
+            thr = max(self.floor * 2.5, 0.0025)
             if not started:
                 # Track the room's noise floor while nobody talks.
                 self.floor = 0.97 * self.floor + 0.03 * min(rms, 0.05)
+                if rms <= thr:
+                    self.noise.append(b)
+                    self.noise = self.noise[-40:]
                 pre.append(b)
                 pre = pre[-12:]  # keep ~360 ms before onset
                 if rms > thr:
                     started = True
                     speech = pre[:]
                     silent = 0.0
+                    self.last_noise = np.concatenate(self.noise) if len(self.noise) >= 8 else None
                 elif initial_silence and time.time() - start_wait > initial_silence:
                     return None
                 continue
@@ -91,11 +160,15 @@ class Mic:
         return None
 
 
-def transcribe(model, audio):
-    peak = float(np.max(np.abs(audio))) or 1.0
-    audio = audio * min(0.9 / peak, 30.0)  # normalise quiet laptop mics
+def transcribe(model, audio, noise=None):
+    if os.environ.get("GC_STT_NO_DSP") != "1":
+        audio = agc(spectral_gate(audio, noise))
+    else:
+        peak = float(np.max(np.abs(audio))) or 1.0
+        audio = audio * min(0.9 / peak, 30.0)
     segs, _ = model.transcribe(audio, language="en", beam_size=1, vad_filter=False,
-                               condition_on_previous_text=False, initial_prompt="Hey Nova.")
+                               condition_on_previous_text=False,
+                               initial_prompt="Hey Nova, it's Frank. Hey Nova, what's the time?")
     parts = [s.text for s in segs if s.no_speech_prob < 0.7 and s.avg_logprob > -1.2]
     return " ".join(p.strip() for p in parts).strip()
 
@@ -105,25 +178,23 @@ def wake_job(mic, model, secs, command_secs, name, cancelled):
     deadline = time.time() + secs
     while time.time() < deadline and not cancelled():
         # VAD end-of-speech: 0.65 s of quiet closes "hey nova, <command>".
-        seg = mic.utterance(deadline, end_silence=0.65, cancelled=cancelled)
+        seg = mic.utterance(deadline, end_silence=0.6, cancelled=cancelled)
         if seg is None:
             break
         t0 = time.time()
-        text = transcribe(model, seg)
+        text = transcribe(model, seg, mic.last_noise)
         words = norm(text)
         if os.environ.get("GC_STT_DEBUG"):
             print(f"heard: {text!r} ({(time.time()-t0)*1000:.0f} ms)", file=sys.stderr, flush=True)
-        if not words or words[0] not in WAKE_ALIASES:
+        rest = match_wake(words, name)
+        if rest is None:
             continue
         out("WAKE")
-        rest = words[1:]
-        if name and rest[: len(name)] == name:
-            rest = rest[len(name):]
         if rest:
             out("TEXT:" + text)
             return 0
         seg = mic.utterance(time.time() + command_secs, initial_silence=6.0, end_silence=0.9, cancelled=cancelled)
-        cmd = transcribe(model, seg) if seg is not None else ""
+        cmd = transcribe(model, seg, mic.last_noise) if seg is not None else ""
         out("TEXT:" + ("" if cmd.lower().strip(" .!?") in JUNK else cmd))
         return 0
     return 1
@@ -179,9 +250,25 @@ def serve(model_name):
         out(f"END {code}")
 
 
+def bench(model_name, files):
+    """Offline check: run 16 kHz mono WAVs through the same DSP + wake match."""
+    import wave
+    model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=4)
+    for f in files:
+        with wave.open(f) as w:
+            a = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768
+        noise = a[:4800] if len(a) > 9600 else None  # first 0.3 s is room tone
+        t0 = time.time()
+        text = transcribe(model, a, noise)
+        hit = match_wake(norm(text), ["nova"]) is not None
+        out(f"{'HIT ' if hit else 'MISS'} {(time.time()-t0)*1000:5.0f}ms {os.path.basename(f)}: {text}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["wake", "listen", "serve"])
+    ap.add_argument("mode", choices=["wake", "listen", "serve", "bench"])
+    ap.add_argument("files", nargs="*")
     ap.add_argument("--secs", type=float, default=12)
     ap.add_argument("--command-secs", type=float, default=10)
     ap.add_argument("--name", default="")
@@ -189,6 +276,8 @@ def main():
     a = ap.parse_args()
     if a.mode == "serve":
         return serve(a.model)
+    if a.mode == "bench":
+        return bench(a.model, a.files)
     try:
         mic = Mic()  # start capturing first so nothing said during model load is lost
         model = WhisperModel(a.model, device="cpu", compute_type="int8", cpu_threads=4)
@@ -211,17 +300,15 @@ def main():
         words = norm(text)
         if os.environ.get("GC_STT_DEBUG"):
             print(f"heard: {text!r}", file=sys.stderr, flush=True)
-        if not words or words[0] not in WAKE_ALIASES:
+        rest = match_wake(words, name)
+        if rest is None:
             continue
         out("WAKE")
-        rest = words[1:]
-        if name and rest[: len(name)] == name:
-            rest = rest[len(name):]
         if rest:
             out("TEXT:" + text)
             return 0
         seg = mic.utterance(time.time() + a.command_secs, initial_silence=6.0, end_silence=1.1)
-        cmd = transcribe(model, seg) if seg is not None else ""
+        cmd = transcribe(model, seg, mic.last_noise) if seg is not None else ""
         out("TEXT:" + ("" if cmd.lower().strip(" .!?") in JUNK else cmd))
         return 0
     return 1
