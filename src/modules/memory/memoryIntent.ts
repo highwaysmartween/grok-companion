@@ -143,5 +143,15 @@ export function toSecondPerson(fact: string): string {
   let f = fact.trim().replace(/[.]+$/, "");
   f = f.replace(/^(?:User|Frank)'s\b/i, "your").replace(/^(?:User|Frank)\s+(\w+)/i, (_, v: string) => `you ${VERBS[v.toLowerCase()] ?? v}`);
   f = f.replace(/\b(?:Frank|the user)'s\b/gi, "your").replace(/\b(?:Frank|the user)\b/gi, "you");
+  // Facts saved in his own words ("my favourite food is ramen", "I work nights").
+  f = f
+    .replace(/\bI am\b/g, "you are")
+    .replace(/\bI'm\b/g, "you're")
+    .replace(/\bI've\b/g, "you've")
+    .replace(/\bI\b/g, "you")
+    .replace(/\bmy\b/gi, "your")
+    .replace(/\bmine\b/gi, "yours")
+    .replace(/\bme\b/gi, "you")
+    .replace(/\bmyself\b/gi, "yourself");
   return f.charAt(0).toLowerCase() + f.slice(1);
 }
