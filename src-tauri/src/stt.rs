@@ -133,6 +133,18 @@ fn whisper_command(args: &[String]) -> Option<(std::process::Command, proc::Temp
     Some((cmd, guard))
 }
 
+const MIC_BLOCKED_MSG: &str = "Windows is blocking the microphone. Turn on Settings > Privacy & security > Microphone (Microphone access + Let desktop apps access your microphone).";
+
+/// PortAudio couldn't open the input: on Windows that's almost always the
+/// microphone privacy switch (MME error 1 / host error -9999) or no mic at all.
+fn mic_blocked(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("error opening inputstream")
+        || e.contains("mme error")
+        || e.contains("paerrorcode -9999")
+        || e.contains("no default input device")
+}
+
 fn whisper_allowed(st: &SttState) -> bool {
     cfg!(windows) && st.whisper.load(Ordering::SeqCst) != 2
 }
@@ -258,6 +270,12 @@ fn ensure_server(st: &SttState) -> Result<(), (i32, String)> {
             Ok(l) if l == "LOADED" => break,
             Ok(l) if l.starts_with("EXIT ") => {
                 let err = err_buf.lock().map(|g| g.clone()).unwrap_or_default();
+                // Mic blocked (Windows privacy) is not "Whisper missing": keep
+                // Whisper enabled so it works as soon as the mic is allowed.
+                if mic_blocked(&err) {
+                    eprintln!("[stt] microphone blocked: {}", err.trim());
+                    return Err((2, MIC_BLOCKED_MSG.to_string()));
+                }
                 let code = if err.contains("unavailable") || err.contains("start failed") {
                     WHISPER_UNAVAILABLE
                 } else {
@@ -746,7 +764,13 @@ pub async fn stt_cancel_wake(state: State<'_, Arc<SttState>>) -> Result<(), Stri
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_phrase;
+    use super::{mic_blocked, sanitize_phrase};
+
+    #[test]
+    fn mic_privacy_block_is_not_whisper_missing() {
+        assert!(mic_blocked("whisper start failed: Error opening InputStream: Unanticipated host error [PaErrorCode -9999]: 'Undefined external error.' [MME error 1]"));
+        assert!(!mic_blocked("whisper unavailable: No module named 'faster_whisper'"));
+    }
 
     #[test]
     fn sanitizes_wake_words() {
