@@ -216,6 +216,33 @@ fn mask_key(key: &str) -> Option<String> {
     Some(format!("••••{tail}"))
 }
 
+/// Strip a UTF-8 BOM from a JSON data file's bytes (None = nothing to do).
+pub fn without_bom(bytes: &[u8]) -> Option<&[u8]> {
+    bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..])
+}
+
+/// Files edited with Windows PowerShell 5 (`Set-Content -Encoding UTF8`) start
+/// with a UTF-8 BOM. serde_json rejects that, so the store silently loaded
+/// *defaults* (no API key, CLI brain, no model). Strip it before anything
+/// opens the store / memory / alarms.
+pub fn repair_data_files(app: &AppHandle) {
+    use tauri::Manager;
+    let Ok(dir) = app.path().app_data_dir() else {
+        return;
+    };
+    for name in [STORE_FILE, "memory.json", "alarms.json"] {
+        let p = dir.join(name);
+        if let Ok(bytes) = std::fs::read(&p) {
+            if let Some(clean) = without_bom(&bytes) {
+                match std::fs::write(&p, clean) {
+                    Ok(()) => eprintln!("[settings] removed UTF-8 BOM from {name}"),
+                    Err(e) => eprintln!("[settings] could not repair {name}: {e}"),
+                }
+            }
+        }
+    }
+}
+
 fn store(
     app: &AppHandle,
 ) -> Result<std::sync::Arc<tauri_plugin_store::Store<tauri::Wry>>, String> {
@@ -326,7 +353,17 @@ pub fn clear_api_key(app: AppHandle) -> Result<PublicSettings, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mask_key, AppSettings};
+    use super::{mask_key, without_bom, AppSettings};
+
+    #[test]
+    fn bom_is_stripped_and_then_parses() {
+        let with_bom = b"\xEF\xBB\xBF{\"settings\":{}}";
+        assert!(serde_json::from_slice::<serde_json::Value>(with_bom).is_err());
+        let clean = without_bom(with_bom).expect("bom detected");
+        assert!(serde_json::from_slice::<serde_json::Value>(clean).is_ok());
+        assert!(without_bom(b"{}").is_none());
+    }
+
 
     #[test]
     fn masks_long_keys() {

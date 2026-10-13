@@ -202,6 +202,8 @@ pub fn run() {
         .manage(Arc::new(TtsState::default()))
         .manage(Arc::new(ToolsState::default()))
         .setup(|app| {
+            // Before anything opens settings.json (a BOM made it load defaults).
+            settings::repair_data_files(app.handle());
             if let Err(e) = build_tray(app) {
                 eprintln!("[tray] could not create tray icon: {e}");
             }
