@@ -1442,7 +1442,7 @@ dependencies = [
 
 [[package]]
 name = "grok-desktop-companion"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "chrono",
  "futures-util",

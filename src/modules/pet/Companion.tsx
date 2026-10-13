@@ -1,4 +1,5 @@
-import { useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ErrorBoundary, logCrash } from "../../ErrorBoundary";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, currentMonitor, primaryMonitor } from "@tauri-apps/api/window";
 import type { FlashMode } from "./flash";
@@ -28,7 +29,12 @@ interface Props {
   scale?: number;
   /** Reports what the flash can do on the loaded model. */
   onFlashMode?: (modelUrl: string, mode: FlashMode) => void;
+  /** Model loaded (ok) or failed / crashed (host falls back to the last good model). */
+  onModelLoad?: (modelUrl: string, ok: boolean) => void;
 }
+
+/** Let rapid model changes settle before tearing down / building a renderer. */
+const MODEL_SWAP_SETTLE_MS = 180;
 
 /** ~30 Hz window moves — smooth enough, far cheaper than per-rAF IPC. */
 const MOVE_INTERVAL_MS = 33;
@@ -184,9 +190,39 @@ export function Companion({
   playful = false,
   scale = 1,
   onFlashMode,
+  onModelLoad,
 }: Props) {
   const driverRef = useRef<RoamDriver | null>(null);
   if (!driverRef.current) driverRef.current = createWindowRoamDriver();
+
+  // Debounced model URL: one renderer build per settled choice, never a race
+  // of two loads (flash → cover-up → flash in quick succession).
+  const [shownUrl, setShownUrl] = useState(modelUrl);
+  useEffect(() => {
+    if (modelUrl === shownUrl) return;
+    const id = window.setTimeout(() => setShownUrl(modelUrl), MODEL_SWAP_SETTLE_MS);
+    return () => window.clearTimeout(id);
+  }, [modelUrl, shownUrl]);
+
+  // Renderer epoch: bumped when the WebGL context is lost → fresh renderer.
+  const [epoch, setEpoch] = useState(0);
+  const lostAt = useRef<number[]>([]);
+  const lostTimer = useRef(0);
+  useEffect(() => () => window.clearTimeout(lostTimer.current), []);
+  const onRendererLost = useCallback(() => {
+    const now = Date.now();
+    lostAt.current = lostAt.current.filter((t) => now - t < 60_000).concat(now);
+    logCrash("pet", new Error(`WebGL context lost (${lostAt.current.length} in 1 min)`));
+    if (lostAt.current.length > 4) return;
+    window.clearTimeout(lostTimer.current);
+    lostTimer.current = window.setTimeout(() => setEpoch((e) => e + 1), 800);
+  }, []);
+  const onModelLoadRef = useRef(onModelLoad);
+  onModelLoadRef.current = onModelLoad;
+  const reportLoad = useCallback((url: string, ok: boolean) => {
+    if (!ok) logCrash("pet", new Error(`model failed to load: ${url}`));
+    onModelLoadRef.current?.(url, ok);
+  }, []);
 
   return (
     <div
@@ -200,11 +236,16 @@ export function Companion({
         </>
       )}
       <div className="pet-3d-wrap" style={compact ? { width: Math.round(400 * scale), height: Math.round(580 * scale) } : undefined}>
+        <ErrorBoundary
+          key={`${PET_VRM_VERSION}-${shownUrl ?? "default"}-${epoch}`}
+          where={`pet ${shownUrl ?? "default"}`}
+          retryMs={3000}
+          onError={() => shownUrl && reportLoad(shownUrl, false)}
+        >
         <CompanionVRM
-          key={`${PET_VRM_VERSION}-${modelUrl ?? "default"}`}
           mood={mood}
           className="pet-3d"
-          modelUrl={modelUrl}
+          modelUrl={shownUrl}
           flash={flash}
           flashKey={flashKey}
           roamAmount={roamAmount}
@@ -214,7 +255,10 @@ export function Companion({
           playful={playful}
           roamDriver={driverRef}
           onFlashMode={onFlashMode}
+          onModelLoad={reportLoad}
+          onRendererLost={onRendererLost}
         />
+        </ErrorBoundary>
       </div>
       {!compact && <div className="nametag">{name}</div>}
     </div>

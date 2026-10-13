@@ -10,7 +10,7 @@ mod window;
 // The old inject.rs (typing into other windows) was removed in v1.1.1 — the
 // companion deliberately has no PC-control surface.
 
-use grok::{cancel_chat, chat_stream, check_connection, list_models, memory_digest, GrokState};
+use grok::{brain_warm, cancel_chat, chat_stream, check_connection, list_models, memory_digest, GrokState};
 use memory::{memory_add_many, memory_clear, memory_delete, memory_list, memory_remember};
 use tools::{alarm_add, alarm_cancel, alarm_list, log_latency, open_target, web_search, ToolsState};
 use window::{pet_hide, pet_repaint_behind, pet_set_bounds};
@@ -240,6 +240,7 @@ pub fn run() {
             check_connection,
             list_models,
             chat_stream,
+            brain_warm,
             cancel_chat,
             memory_list,
             memory_remember,

@@ -35,26 +35,35 @@ def norm(t):
 
 
 WAKE_ALIASES = {"hey", "hay", "heyy", "hei", "heya", "hey,", "a", "ah", "and", "an", "okay", "ok", "hi"}
+# Fillers Whisper slips between "hey" and the name: "hey and nova", "hey there nova", "hey, a nova".
+WAKE_FILLERS = WAKE_ALIASES | {"there", "uh", "um"}
 # How Whisper tends to hear "Nova" on a quiet laptop mic.
 NAME_ALIASES = {"nova", "noah", "nover", "novah", "nava", "noba", "novo", "nora", "knova", "innova", "anova"}
+# Wake + name glued into one token ("a nova" -> "anova", "and nova" -> "andnova").
+GLUED_WAKE = {"anova", "annova", "andnova", "anddnova", "heynova", "haynova", "enova"}
 
 
 def match_wake(words, name):
     """Remaining words if the utterance STARTS with the wake phrase, else None.
-    Requiring it at the very start keeps movie/TV dialogue from waking her."""
+    Requiring it at the very start keeps movie/TV dialogue from waking her.
+    Accepts "hey nova", "and nova", "a nova", "hey and nova", "hey there nova"."""
     if not words:
         return None
     names = set(NAME_ALIASES)
     if name:
         names.add(name[0])
     w = words[:]
-    if w[0] in ("anova", "annova"):  # "a nova" glued together
+    if w[0] in GLUED_WAKE:
         return w[1:]
     if w[0] not in WAKE_ALIASES:
         return None
     w = w[1:]
-    if w and w[0] in ("there", "hey"):
-        w = w[1:]
+    # Up to two filler words between the wake word and the name.
+    for _ in range(2):
+        if w and w[0] in GLUED_WAKE:
+            return w[1:]
+        if w and w[0] not in names and w[0] in WAKE_FILLERS:
+            w = w[1:]
     if not w or w[0] not in names:
         return None
     return w[1:]

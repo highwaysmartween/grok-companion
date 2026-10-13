@@ -12,7 +12,7 @@ import { StatusBar } from "./modules/status/StatusBar";
 import { useChat } from "./modules/chat/useChat";
 import { useVoice } from "./modules/voice/useVoice";
 import { getSettings, saveSettings, toPayload } from "./modules/settings/settingsApi";
-import { checkConnection } from "./modules/chat/chatApi";
+import { checkConnection, warmBrain } from "./modules/chat/chatApi";
 import { latencyMark } from "./modules/chat/latency";
 import { playChime } from "./modules/voice/speech";
 import type { FlashMode } from "./modules/pet/flash";
@@ -89,6 +89,9 @@ export default function App() {
     setCue({ kind, id: cueSeq.current });
   }, []);
   const preFlashIdx = useRef<number | null>(null);
+  /** Last model that actually loaded — the fallback if a swap fails. */
+  const lastGoodIdx = useRef<number | null>(null);
+  const modelIdxRef = useRef(0);
   const flashModes = useRef<Record<string, FlashMode>>({});
   const [scale, setScale] = useState(1);
   const scaleRef = useRef(1);
@@ -103,6 +106,27 @@ export default function App() {
   const lastMoveBump = useRef(0);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  modelIdxRef.current = modelIdx;
+  const catalogRef = useRef<ModelOpt[]>([]);
+  catalogRef.current = modelsCatalog;
+  useEffect(() => () => window.clearTimeout(coverSwapTimer.current), []);
+
+  // A model that fails to load (or crashes the renderer) must not leave an
+  // empty window: go back to the last one that worked, else the first.
+  const onModelLoad = useCallback((url: string, ok: boolean) => {
+    const list = catalogRef.current;
+    const idx = list.findIndex((m) => m.file === url);
+    if (ok) {
+      if (idx >= 0) lastGoodIdx.current = idx;
+      return;
+    }
+    if (idx < 0 || idx !== modelIdxRef.current) return; // stale report
+    const back = lastGoodIdx.current != null && lastGoodIdx.current !== idx ? lastGoodIdx.current : idx !== 0 && list.length ? 0 : null;
+    if (back == null) return;
+    console.warn("[app] model failed, falling back", url, "→", list[back]?.file);
+    if (preFlashIdx.current === back) preFlashIdx.current = null;
+    setModelIdx(back);
+  }, []);
 
   const touchMood = useCallback((next: PetMood) => {
     lastInteractionRef.current = Date.now();
@@ -118,6 +142,7 @@ export default function App() {
     voice: settings?.voiceTarget,
     onWake: () => {
       latencyMark("wake");
+      warmBrain();
       fireCue("wave");
     },
     onAudioStart: () => latencyMark("audio-start"),
@@ -566,7 +591,7 @@ export default function App() {
       }}
       title="Tap to chat · drag to move · scroll to resize"
     >
-      <Companion mood={mood} name={name} compact={compact} modelUrl={modelsCatalog[modelIdx]?.file} flash={flash} flashKey={flashKey} roamAmount={roamAmount} roamPaused={roamPaused} reactKey={reactKey} cue={cue} playful={!!settings?.playful} scale={scale} onFlashMode={(url, m) => { flashModes.current[url] = m; }} />
+      <Companion mood={mood} name={name} compact={compact} modelUrl={modelsCatalog[modelIdx]?.file} flash={flash} flashKey={flashKey} roamAmount={roamAmount} roamPaused={roamPaused} reactKey={reactKey} cue={cue} playful={!!settings?.playful} scale={scale} onFlashMode={(url, m) => { flashModes.current[url] = m; }} onModelLoad={onModelLoad} />
     </div>
     {!compact && <StatusBar connection={connection} connectionMessage={connectionMessage} mood={mood} listening={voice.listening} speaking={voice.speaking} busy={chat.busy} wakeArmed={voice.wakeArmed} interim={voice.interim} />}
     {(!compact || chatOpen) && <div className={compact ? "compact-chat" : "full-chat"}>

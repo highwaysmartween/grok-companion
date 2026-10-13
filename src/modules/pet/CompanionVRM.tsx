@@ -64,6 +64,10 @@ interface Props {
   cue?: GestureCue | null;
   /** Host that moves the transparent Tauri window during a stroll. */
   roamDriver?: MutableRefObject<RoamDriver | null>;
+  /** Model finished loading (ok) or failed (the host can fall back to the last good one). */
+  onModelLoad?: (modelUrl: string, ok: boolean) => void;
+  /** WebGL context was lost (GPU reset / too many contexts): the host remounts the renderer. */
+  onRendererLost?: () => void;
 }
 
 export const PET_VRM_VERSION = 20;
@@ -211,9 +215,15 @@ export function CompanionVRM({
   cue = null,
   roamDriver,
   onFlashMode,
+  onModelLoad,
+  onRendererLost,
 }: Props) {
   const onFlashModeRef = useRef(onFlashMode);
   onFlashModeRef.current = onFlashMode;
+  const onModelLoadRef = useRef(onModelLoad);
+  onModelLoadRef.current = onModelLoad;
+  const onRendererLostRef = useRef(onRendererLost);
+  onRendererLostRef.current = onRendererLost;
   const mountRef = useRef<HTMLDivElement>(null);
   const moodRef = useRef(mood);
   const flashRef = useRef(flash);
@@ -256,6 +266,14 @@ export function CompanionVRM({
     // Keep NoToneMapping + neutral white lights — ACES / warm/cheek/rim muddied skins brown
     renderer.toneMapping = THREE.NoToneMapping;
     el.appendChild(renderer.domElement);
+    // A lost context (GPU reset, WebView2 context limit) would otherwise leave
+    // a blank, silent window: tell the host so it can rebuild the renderer.
+    const onContextLost = (e: Event) => {
+      e.preventDefault();
+      console.warn("[pet] WebGL context lost", modelUrl);
+      onRendererLostRef.current?.();
+    };
+    renderer.domElement.addEventListener("webglcontextlost", onContextLost);
 
     const maxAniso = Math.min(renderer.capabilities.getMaxAnisotropy?.() ?? 4, 4);
 
@@ -664,7 +682,15 @@ export function CompanionVRM({
     void (async () => {
       try {
         const gltf = await loader.loadAsync(modelUrl);
-        if (disposed) return;
+        if (disposed) {
+          // Swapped away while this was still loading: free it, never add it.
+          try {
+            VRMUtils.deepDispose(gltf.scene);
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
         const loaded = gltf.userData.vrm as VRM | undefined;
         if (!loaded) throw new Error("No VRM in model");
 
@@ -731,6 +757,7 @@ export function CompanionVRM({
         if (disposed || !mixer) return;
         crossfade("idle", 0.01);
         ready = true;
+        onModelLoadRef.current?.(modelUrl, true);
         console.info("[pet] ready v", PET_VRM_VERSION, modelUrl, "clips:", [...loadedClips], "expr:", [...available]);
         if (!greetedThisSession) {
           greetedThisSession = true;
@@ -741,7 +768,8 @@ export function CompanionVRM({
           if (!disposed) console.info("[pet] clips loaded:", [...loadedClips], failedClips.size ? `dropped: ${[...failedClips]}` : "");
         });
       } catch (err) {
-        console.error("[pet] load failed", err);
+        console.error("[pet] load failed", modelUrl, err);
+        if (!disposed) onModelLoadRef.current?.(modelUrl, false);
       }
     })();
 
@@ -1457,6 +1485,7 @@ export function CompanionVRM({
     const clock = new THREE.Clock();
     const frameInterval = 1 / TARGET_FPS;
     let acc = 0;
+    let frameErrors = 0;
     const step = (dt: number) => {
       t += dt;
       if (vrm && mixer && ready) {
@@ -1477,8 +1506,15 @@ export function CompanionVRM({
       if (acc < frameInterval - 0.002) return;
       const dt = Math.min(acc, 0.1);
       acc = 0;
-      step(dt);
-      renderer.render(scene, camera);
+      // One bad frame (e.g. mid model swap) must not kill the loop or the window.
+      try {
+        step(dt);
+        renderer.render(scene, camera);
+        frameErrors = 0;
+      } catch (err) {
+        frameErrors += 1;
+        if (frameErrors === 1 || frameErrors % 300 === 0) console.error("[pet] frame error", frameErrors, err);
+      }
     };
 
     const start = () => {
@@ -1612,6 +1648,7 @@ export function CompanionVRM({
     return () => {
       disposed = true;
       cancelAnimationFrame(frame);
+      renderer.domElement.removeEventListener("webglcontextlost", onContextLost);
       window.clearTimeout(cursorTimer);
       window.clearTimeout(visTimer);
       window.removeEventListener("mousemove", onMouseMove);
@@ -1633,6 +1670,14 @@ export function CompanionVRM({
         VRMUtils.deepDispose(vrm.scene);
       }
       renderer.dispose();
+      // dispose() keeps the GL context alive; WebView2 caps live contexts
+      // (~16), so repeated model swaps eventually killed the oldest — and the
+      // window went blank. Release it explicitly.
+      try {
+        renderer.forceContextLoss();
+      } catch {
+        /* already lost */
+      }
       if (renderer.domElement.parentElement === el) el.removeChild(renderer.domElement);
     };
   }, [modelUrl]);

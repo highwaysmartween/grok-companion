@@ -273,7 +273,7 @@ export function useChat(controller: ChatController) {
           setMessages((m) => m.map((msg) => msg.id === assistantId ? { ...msg, content: splitTags(assembled).clean || event.data.message, pending: false, error: !assembled } : msg));
           setMood("error");
         }
-      });
+      }, { voice: meta?.fromVoice === true });
       window.clearTimeout(ackTimer);
       const { clean, remember, actions } = splitTags(assembled);
       if (!aborting.current && clean) {

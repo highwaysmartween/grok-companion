@@ -32,6 +32,18 @@ const MAX_SYSTEM_CHARS: usize = 9_000;
 /// Legacy `-p <prompt>` fallback: whole prompt must stay well under 32k.
 const MAX_LEGACY_PROMPT_CHARS: usize = 20_000;
 
+/// Spoken (voice) turns on the xAI API use a fast non-reasoning model: grok-4.7
+/// defaults to `high` reasoning and spends ~8-10 s thinking before its first
+/// word, while grok-4.3 with `reasoning_effort: none` starts streaming in <1 s.
+/// Typed chat keeps the model chosen in Settings.
+pub const VOICE_FAST_MODEL: &str = "grok-4.3";
+const VOICE_REASONING_EFFORT: &str = "none";
+/// Spoken replies are 1-3 sentences; a low cap stops rambling (and TTS time).
+const VOICE_MAX_TOKENS: u32 = 240;
+/// Leaner context on voice turns (~6 exchanges) = smaller prompt, faster first token.
+const VOICE_HISTORY_MESSAGES: usize = 12;
+const VOICE_HISTORY_CHARS: usize = 4_000;
+
 pub struct GrokState {
     pub cancel: AtomicBool,
     /// PID of the running grok CLI child (0 = none) so cancel can kill it.
@@ -42,6 +54,13 @@ pub struct GrokState {
     /// Model id the installed CLI rejected this session ("unknown model id").
     /// While the setting still names it we run without `-m` (CLI default).
     pub cli_rejected_model: Mutex<Option<String>>,
+    /// The API rejected the voice fast model / reasoning param this session →
+    /// voice turns use the Settings model like typed chat.
+    pub voice_fast_rejected: AtomicBool,
+    /// API failed auth/credits this session (auto brain) → voice uses the CLI.
+    pub api_unusable: AtomicBool,
+    /// Last API warm-up (ms since epoch) so wake words don't spam it.
+    pub last_warm_ms: std::sync::atomic::AtomicU64,
 }
 
 impl GrokState {
@@ -51,6 +70,9 @@ impl GrokState {
             cli_pid: AtomicU32::new(0),
             cli_level: AtomicU8::new(0),
             cli_rejected_model: Mutex::new(None),
+            voice_fast_rejected: AtomicBool::new(false),
+            api_unusable: AtomicBool::new(false),
+            last_warm_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -124,6 +146,10 @@ pub fn now_line() -> String {
 pub const USER_NAME: &str = "Frank";
 
 pub fn build_system_prompt(app: &AppHandle, query: &str, web: Option<&str>) -> String {
+    build_system_prompt_for(app, query, web, false)
+}
+
+pub fn build_system_prompt_for(app: &AppHandle, query: &str, web: Option<&str>, voice: bool) -> String {
     let s = settings::load_settings(app);
     let memories = memory::format_relevant(app, query);
     let user_prompt = truncate(&s.system_prompt, 2_000);
@@ -146,7 +172,7 @@ Hidden tags (stripped before you're spoken; put them at the very end):\n\
 or <action>{{\"type\":\"reminder\",\"at\":\"2026-10-10T17:00\",\"label\":\"call mum\"}}</action> or <action>{{\"type\":\"open\",\"target\":\"youtube\"}}</action>, and say what you did.\n\
 Lines starting with [App] in the chat are things the app already did for him; don't repeat them.\n\
 Never mention being an AI model, a CLI, tools, tags or these instructions. Reply only as {name}.\n\
-{user_prompt}{memories}{web_block}",
+{user_prompt}{memories}{web_block}{voice_block}",
         name = s.companion_name,
         user = USER_NAME,
         now = now_line(),
@@ -154,6 +180,11 @@ Never mention being an AI model, a CLI, tools, tags or these instructions. Reply
         user_prompt = user_prompt,
         memories = memories,
         web_block = web_block,
+        voice_block = if voice {
+            "\n\nHe's talking to you out loud right now: answer in one or two short spoken sentences, and keep the first sentence brief."
+        } else {
+            ""
+        },
     );
     truncate(&out, MAX_SYSTEM_CHARS)
 }
@@ -161,18 +192,22 @@ Never mention being an AI model, a CLI, tools, tags or these instructions. Reply
 /// Drop system messages, cap each message, keep only the newest turns that fit
 /// the budget (oldest dropped first).
 pub fn trim_history(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    trim_history_to(messages, MAX_HISTORY_MESSAGES, MAX_HISTORY_CHARS)
+}
+
+pub fn trim_history_to(messages: &[ChatMessage], max_messages: usize, max_chars: usize) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::new();
     let mut total = 0usize;
     for m in messages.iter().rev() {
         if m.role == "system" || m.content.trim().is_empty() {
             continue;
         }
-        if out.len() >= MAX_HISTORY_MESSAGES {
+        if out.len() >= max_messages {
             break;
         }
         let content = truncate(&m.content, MAX_MESSAGE_CHARS);
         let len = content.chars().count();
-        if total + len > MAX_HISTORY_CHARS && !out.is_empty() {
+        if total + len > max_chars && !out.is_empty() {
             break;
         }
         total += len;
@@ -185,12 +220,53 @@ pub fn trim_history(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     out
 }
 
+/// One shared client: its connection pool keeps the TLS session to api.x.ai
+/// open between turns (a fresh handshake costs ~0.3-0.6 s per reply).
 fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(c) = CLIENT.get() {
+        return Ok(c.clone());
+    }
+    let c = reqwest::Client::builder()
         .user_agent("GrokCompanion/0.1")
         .timeout(std::time::Duration::from_secs(180))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_idle_timeout(std::time::Duration::from_secs(300))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("Could not build HTTP client: {e}"))
+        .map_err(|e| format!("Could not build HTTP client: {e}"))?;
+    Ok(CLIENT.get_or_init(|| c).clone())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Called on "hey Nova": opens (or refreshes) the pooled HTTPS connection to
+/// xAI while he's still speaking, so the reply request skips DNS + TLS.
+#[tauri::command]
+pub async fn brain_warm(app: AppHandle, state: State<'_, Arc<GrokState>>) -> Result<(), String> {
+    let now = now_ms();
+    let last = state.last_warm_ms.load(Ordering::SeqCst);
+    if now.saturating_sub(last) < 20_000 {
+        return Ok(());
+    }
+    state.last_warm_ms.store(now, Ordering::SeqCst);
+    let Some(api_key) = settings::load_api_key(&app) else {
+        return Ok(());
+    };
+    let client = http_client()?;
+    let _ = client
+        .get(XAI_MODELS_URL)
+        .bearer_auth(&api_key)
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .map(|r| r.status());
+    Ok(())
 }
 
 fn resolve_grok_cli() -> Option<PathBuf> {
@@ -948,122 +1024,206 @@ pub async fn chat_stream(
     app: AppHandle,
     state: State<'_, Arc<GrokState>>,
     messages: Vec<ChatMessage>,
+    voice: Option<bool>,
     on_event: Channel<ChatStreamEvent>,
 ) -> Result<(), String> {
     let request_id = uuid::Uuid::new_v4().to_string();
     state.cancel.store(false, Ordering::SeqCst);
+    let voice = voice.unwrap_or(false);
 
-    let provider = provider_choice(&app);
+    let s = settings::load_settings(&app);
+    let key_present = settings::load_api_key(&app).is_some();
+    let auto = s.brain_provider.trim().eq_ignore_ascii_case("auto");
+    let mut provider = provider_for(&s, key_present);
+    // Auto brain + a key: spoken turns go to the streaming API (first word <1 s)
+    // instead of spawning the CLI agent per turn — unless the API already
+    // failed auth/credits this session.
+    if voice && auto && key_present && provider == Provider::Cli && !state.api_unusable.load(Ordering::SeqCst) {
+        provider = Provider::Api;
+    }
     // Current-info questions: fetch weather / search results up front so the
     // model answers in ONE turn instead of spending tool round-trips.
     let web = crate::tools::web_context(&last_user_text(&messages)).await;
-    if provider == Provider::Cli {
-        let grok_state = Arc::clone(&*state);
-        let app2 = app.clone();
-        let on2 = on_event.clone();
-        let rid = request_id.clone();
-        let result = tauri::async_runtime::spawn_blocking(move || {
-            run_grok_cli(&app2, &messages, web.as_deref(), &on2, &rid, &grok_state)
-        })
-        .await
-        .map_err(|e| format!("CLI task join error: {e}"))?;
 
-        match result {
+    if provider == Provider::Api {
+        match chat_stream_api(&app, state.inner().as_ref(), &messages, web.as_deref(), voice, &on_event, &request_id).await {
             Ok(full_text) => {
-                let _ = on_event.send(ChatStreamEvent::Done {
-                    request_id,
-                    full_text,
-                });
-                Ok(())
+                let _ = on_event.send(ChatStreamEvent::Done { request_id, full_text });
+                return Ok(());
             }
-            Err(message) => {
-                let _ = on_event.send(ChatStreamEvent::Error {
-                    request_id,
-                    message: message.clone(),
-                });
-                Err(message)
+            Err(e) => {
+                // Auto brain: an unusable key (no credits / bad key) falls back to
+                // the CLI if it's signed in, as long as nothing was spoken yet.
+                let fallback = auto && !e.streamed && e.auth && cli_status().ready();
+                if e.auth {
+                    state.api_unusable.store(true, Ordering::SeqCst);
+                }
+                if !fallback {
+                    let _ = on_event.send(ChatStreamEvent::Error {
+                        request_id,
+                        message: e.message.clone(),
+                    });
+                    return Err(e.message);
+                }
+                eprintln!("[brain] API unusable ({}); falling back to the Grok CLI", truncate(&e.message, 160));
             }
         }
+    }
+
+    let grok_state = Arc::clone(&*state);
+    let app2 = app.clone();
+    let on2 = on_event.clone();
+    let rid = request_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        run_grok_cli(&app2, &messages, web.as_deref(), &on2, &rid, &grok_state)
+    })
+    .await
+    .map_err(|e| format!("CLI task join error: {e}"))?;
+
+    match result {
+        Ok(full_text) => {
+            let _ = on_event.send(ChatStreamEvent::Done {
+                request_id,
+                full_text,
+            });
+            Ok(())
+        }
+        Err(message) => {
+            let _ = on_event.send(ChatStreamEvent::Error {
+                request_id,
+                message: message.clone(),
+            });
+            Err(message)
+        }
+    }
+}
+
+struct ApiFail {
+    message: String,
+    /// Some text already reached the UI (never retry / fall back then).
+    streamed: bool,
+    /// 401/403 / credits: the key can't be used at all.
+    auth: bool,
+    /// 400/404/422: request shape (model id / param) rejected.
+    bad_request: bool,
+}
+
+impl ApiFail {
+    fn new(message: String) -> Self {
+        Self { message, streamed: false, auth: false, bad_request: false }
+    }
+}
+
+/// Model, reasoning effort and token cap for this turn.
+fn api_plan(settings: &settings::AppSettings, voice: bool, fast: bool) -> (String, Option<&'static str>, u32) {
+    let chosen = if settings.model.trim().is_empty() {
+        DEFAULT_MODEL.to_string()
     } else {
-        chat_stream_api(app, state, messages, web, on_event, request_id).await
+        settings.model.trim().to_string()
+    };
+    if voice && fast {
+        (
+            VOICE_FAST_MODEL.to_string(),
+            Some(VOICE_REASONING_EFFORT),
+            settings.max_tokens.min(VOICE_MAX_TOKENS).max(64),
+        )
+    } else {
+        (chosen, None, settings.max_tokens)
     }
 }
 
 async fn chat_stream_api(
-    app: AppHandle,
-    state: State<'_, Arc<GrokState>>,
-    messages: Vec<ChatMessage>,
-    web: Option<String>,
-    on_event: Channel<ChatStreamEvent>,
-    request_id: String,
-) -> Result<(), String> {
-    let Some(api_key) = settings::load_api_key(&app) else {
-        let msg = "No API key saved. Open Settings and paste your xAI key, or switch Brain to Grok CLI.".to_string();
-        let _ = on_event.send(ChatStreamEvent::Error {
-            request_id: request_id.clone(),
-            message: msg.clone(),
-        });
-        return Err(msg);
+    app: &AppHandle,
+    state: &GrokState,
+    messages: &[ChatMessage],
+    web: Option<&str>,
+    voice: bool,
+    on_event: &Channel<ChatStreamEvent>,
+    request_id: &str,
+) -> Result<String, ApiFail> {
+    let Some(api_key) = settings::load_api_key(app) else {
+        return Err(ApiFail::new(
+            "No API key saved. Open Settings and paste your xAI key, or switch Brain to Grok CLI.".to_string(),
+        ));
     };
-
-    let settings = settings::load_settings(&app);
-    let model = if settings.model.trim().is_empty() {
-        DEFAULT_MODEL.to_string()
+    let settings = settings::load_settings(app);
+    let history = if voice {
+        trim_history_to(messages, VOICE_HISTORY_MESSAGES, VOICE_HISTORY_CHARS)
     } else {
-        settings.model.clone()
+        trim_history(messages)
     };
+    let system = build_system_prompt_for(app, &last_user_text(&history), web, voice);
 
+    let mut fast = voice && !state.voice_fast_rejected.load(Ordering::SeqCst);
+    loop {
+        let (model, effort, max_tokens) = api_plan(&settings, voice, fast);
+        match api_attempt(&api_key, &system, &history, &model, effort, max_tokens, settings.temperature, state, on_event, request_id).await {
+            Err(e) if fast && !e.streamed && e.bad_request => {
+                eprintln!("[brain] voice fast model rejected ({}); using {}", truncate(&e.message, 160), settings.model);
+                state.voice_fast_rejected.store(true, Ordering::SeqCst);
+                fast = false;
+                continue;
+            }
+            other => return other,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn api_attempt(
+    api_key: &str,
+    system: &str,
+    history: &[ChatMessage],
+    model: &str,
+    effort: Option<&str>,
+    max_tokens: u32,
+    temperature: f32,
+    state: &GrokState,
+    on_event: &Channel<ChatStreamEvent>,
+    request_id: &str,
+) -> Result<String, ApiFail> {
     let _ = on_event.send(ChatStreamEvent::Started {
-        request_id: request_id.clone(),
-        model: model.clone(),
+        request_id: request_id.to_string(),
+        model: model.to_string(),
     });
 
-    let mut payload_messages = Vec::new();
-    payload_messages.push(json!({
-        "role": "system",
-        "content": build_system_prompt(&app, &last_user_text(&messages), web.as_deref()),
-    }));
-    for m in &trim_history(&messages) {
-        payload_messages.push(json!({
-            "role": m.role,
-            "content": m.content,
-        }));
+    let mut payload_messages = Vec::with_capacity(history.len() + 1);
+    payload_messages.push(json!({ "role": "system", "content": system }));
+    for m in history {
+        payload_messages.push(json!({ "role": m.role, "content": m.content }));
     }
-
-    let body = json!({
+    let mut body = json!({
         "model": model,
         "messages": payload_messages,
         "stream": true,
-        "temperature": settings.temperature,
-        "max_tokens": settings.max_tokens,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
     });
+    if let Some(effort) = effort {
+        body["reasoning_effort"] = json!(effort);
+    }
 
-    let client = http_client()?;
+    let client = http_client().map_err(ApiFail::new)?;
     let response = client
         .post(XAI_CHAT_URL)
-        .bearer_auth(&api_key)
+        .bearer_auth(api_key)
         .header("Accept", "text/event-stream")
         .json(&body)
         .send()
         .await
-        .map_err(|e| {
-            let msg = format!("Could not reach xAI: {e}");
-            let _ = on_event.send(ChatStreamEvent::Error {
-                request_id: request_id.clone(),
-                message: msg.clone(),
-            });
-            msg
-        })?;
+        .map_err(|e| ApiFail::new(format!("Could not reach xAI: {e}")))?;
 
     if !response.status().is_success() {
-        let status = response.status();
+        let status = response.status().as_u16();
         let err_body = response.text().await.unwrap_or_default();
-        let message = parse_api_error(status.as_u16(), &err_body);
-        let _ = on_event.send(ChatStreamEvent::Error {
-            request_id: request_id.clone(),
-            message: message.clone(),
+        let message = parse_api_error(status, &err_body);
+        let lower = message.to_lowercase();
+        return Err(ApiFail {
+            auth: status == 401 || status == 403 || lower.contains("credit") || lower.contains("api key"),
+            bad_request: matches!(status, 400 | 404 | 422),
+            streamed: false,
+            message,
         });
-        return Err(message);
     }
 
     let mut stream = response.bytes_stream();
@@ -1072,29 +1232,17 @@ async fn chat_stream_api(
 
     while let Some(chunk) = stream.next().await {
         if state.cancel.load(Ordering::SeqCst) {
-            let _ = on_event.send(ChatStreamEvent::Done {
-                request_id: request_id.clone(),
-                full_text: full_text.clone(),
-            });
-            return Ok(());
+            return Ok(full_text);
         }
-
-        let bytes = chunk.map_err(|e| {
-            let msg = format!("Stream interrupted: {e}");
-            let _ = on_event.send(ChatStreamEvent::Error {
-                request_id: request_id.clone(),
-                message: msg.clone(),
-            });
-            msg
+        let bytes = chunk.map_err(|e| ApiFail {
+            message: format!("Stream interrupted: {e}"),
+            streamed: !full_text.is_empty(),
+            auth: false,
+            bad_request: false,
         })?;
-
         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
-        loop {
-            let sep = match buffer.find('\n') {
-                Some(i) => i,
-                None => break,
-            };
+        while let Some(sep) = buffer.find('\n') {
             let mut line = buffer[..sep].to_string();
             buffer.drain(..=sep);
             if line.ends_with('\r') {
@@ -1109,11 +1257,7 @@ async fn chat_stream_api(
             };
             let data = data.trim();
             if data == "[DONE]" {
-                let _ = on_event.send(ChatStreamEvent::Done {
-                    request_id: request_id.clone(),
-                    full_text: full_text.clone(),
-                });
-                return Ok(());
+                return Ok(full_text);
             }
             if let Ok(v) = serde_json::from_str::<Value>(data) {
                 if let Some(err) = v.get("error") {
@@ -1122,20 +1266,18 @@ async fn chat_stream_api(
                         .and_then(|m| m.as_str())
                         .unwrap_or("xAI stream error")
                         .to_string();
-                    let _ = on_event.send(ChatStreamEvent::Error {
-                        request_id: request_id.clone(),
-                        message: message.clone(),
+                    return Err(ApiFail {
+                        message,
+                        streamed: !full_text.is_empty(),
+                        auth: false,
+                        bad_request: false,
                     });
-                    return Err(message);
                 }
-                if let Some(text) = v
-                    .pointer("/choices/0/delta/content")
-                    .and_then(|c| c.as_str())
-                {
+                if let Some(text) = v.pointer("/choices/0/delta/content").and_then(|c| c.as_str()) {
                     if !text.is_empty() {
                         full_text.push_str(text);
                         let _ = on_event.send(ChatStreamEvent::Delta {
-                            request_id: request_id.clone(),
+                            request_id: request_id.to_string(),
                             text: text.to_string(),
                         });
                     }
@@ -1143,12 +1285,7 @@ async fn chat_stream_api(
             }
         }
     }
-
-    let _ = on_event.send(ChatStreamEvent::Done {
-        request_id,
-        full_text,
-    });
-    Ok(())
+    Ok(full_text)
 }
 
 fn parse_api_error(status: u16, body: &str) -> String {
@@ -1247,6 +1384,27 @@ mod tests {
         st.reject_cli_model("grok-4.6");
         assert!(st.cli_model_rejected("grok-4.6"));
         assert!(!st.cli_model_rejected("grok-4.7"));
+    }
+
+    #[test]
+    fn voice_turns_use_fast_model_and_low_cap() {
+        let mut st = settings::AppSettings::default();
+        st.model = "grok-4.7".into();
+        st.max_tokens = 1024;
+        let (m, e, t) = api_plan(&st, true, true);
+        assert_eq!(m, VOICE_FAST_MODEL);
+        assert_eq!(e, Some("none"));
+        assert_eq!(t, VOICE_MAX_TOKENS);
+        let (m, e, t) = api_plan(&st, false, true);
+        assert_eq!((m.as_str(), e, t), ("grok-4.7", None, 1024));
+        let (m, e, _) = api_plan(&st, true, false);
+        assert_eq!((m.as_str(), e), ("grok-4.7", None));
+    }
+
+    #[test]
+    fn voice_history_is_leaner() {
+        let msgs: Vec<ChatMessage> = (0..40).map(|i| msg(if i % 2 == 0 { "user" } else { "assistant" }, 50)).collect();
+        assert_eq!(trim_history_to(&msgs, VOICE_HISTORY_MESSAGES, VOICE_HISTORY_CHARS).len(), VOICE_HISTORY_MESSAGES);
     }
 
     #[test]
